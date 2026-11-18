@@ -17,7 +17,7 @@ UUOB keeps them in sync.
 No UUOB on this device? In UUOB on another device choose **Apps → Connect with a code**, and type the code
 into Photos. [Full setup guide →](https://github.com/UUOB/uuob/blob/main/docs/setup.md)
 
-**It saves space on your phone.** Make a Mac or a Raspberry Pi with plenty of space a *storage device*
+**It saves space on your phone.** Make a Mac or a Linux server with plenty of space a *storage device*
 (under **Devices** in UUOB). The phone then keeps small previews and lets go of an original only once the
 storage device has it. Open the photo and it comes back.
 
