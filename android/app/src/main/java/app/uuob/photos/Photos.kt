@@ -16,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -275,6 +276,40 @@ class PhotosModel(private val ctx: Context) {
   suspend fun remove(p: JSONObject) = client.put("photos", p.optString("container"), null, markDeleted(p.toString(), System.currentTimeMillis()))
   suspend fun restore(p: JSONObject) = client.put("photos", p.optString("container"), null, markDeleted(p.toString(), 0))
 
+  /**
+   * Saves the originals to this phone's gallery (Pictures/UUOB, videos in
+   * Movies/UUOB). Returns how many were saved; the rest were on a storage
+   * device that couldn't be reached.
+   */
+  suspend fun download(list: List<JSONObject>): Int = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    var saved = 0
+    for (p in list) {
+      val bytes = runCatching { client.readFile(p.optString("container"), p.optString("file")) }.getOrNull() ?: continue
+      val video = isVideo(p)
+      val type = p.optString("type").ifEmpty { if (video) "video/mp4" else "image/jpeg" }
+      val name = p.optString("name").ifEmpty { "UUOB-${p.optLong("taken")}" }
+      runCatching {
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+          val values = android.content.ContentValues().apply {
+            put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(android.provider.MediaStore.MediaColumns.MIME_TYPE, type)
+            put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, (if (video) "Movies" else "Pictures") + "/UUOB")
+            if (p.has("taken")) put(android.provider.MediaStore.MediaColumns.DATE_TAKEN, p.optLong("taken"))
+          }
+          val where = if (video) android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI else android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+          val uri = ctx.contentResolver.insert(where, values)!!
+          ctx.contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
+        } else {
+          // Older Android: the app's own Pictures folder (no storage permission needed).
+          val dir = ctx.getExternalFilesDir(if (video) android.os.Environment.DIRECTORY_MOVIES else android.os.Environment.DIRECTORY_PICTURES)!!
+          File(dir, name).writeBytes(bytes)
+        }
+        saved++
+      }
+    }
+    saved
+  }
+
   suspend fun destroy(p: JSONObject) {
     val c = p.optString("container")
     runCatching { client.deleteFile(c, p.optString("file")) }
@@ -322,6 +357,15 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
   var trashView by remember { mutableStateOf(false) }
   var open by remember { mutableStateOf<JSONObject?>(null) }
   var confirm by remember { mutableStateOf<JSONObject?>(null) }
+  // Long-press a photo to choose several: then Download or Delete them together.
+  var chosen by remember { mutableStateOf(setOf<String>()) }
+  var note by remember { mutableStateOf("") }
+  fun keyOf(p: JSONObject) = p.optString("container") + "/" + p.optString("id")
+  fun download(list: List<JSONObject>) = scope.launch {
+    note = "Downloading…"
+    val n = model.download(list)
+    note = if (n == list.size) "Saved to your gallery" else "Saved $n of ${list.size}: the rest are on a device that can’t be reached"
+  }
   val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
     if (uris.isNotEmpty()) scope.launch { model.add(uris) }
   }
@@ -336,7 +380,9 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
   val trashCount = g.optInt("trash")
   val groups = objects(g.optJSONArray("groups")?.toString())
   val shown = groups.flatMap { objects(it.optJSONArray("items")?.toString()) }
-  BackHandler(enabled = trashView && open == null) { trashView = false }
+  BackHandler(enabled = trashView && open == null && chosen.isEmpty()) { trashView = false }
+  BackHandler(enabled = chosen.isNotEmpty() && open == null) { chosen = emptySet() }
+  val picked = shown.filter { keyOf(it) in chosen }
 
   BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
     val phone = maxWidth < 720.dp
@@ -349,7 +395,16 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
     ) {
       item(span = { GridItemSpan(maxLineSpan) }) {
         Row(Modifier.padding(bottom = 18.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-          if (trashView) {
+          if (chosen.isNotEmpty()) {
+            IconBtn("close", { chosen = emptySet() })
+            Text("${chosen.size} selected", fontSize = if (phone) 26.sp else 30.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.6).sp, maxLines = 1, modifier = Modifier.weight(1f))
+            if (!trashView) {
+              IconBtn("download", { download(picked); chosen = emptySet() }, size = 20.dp, description = "Download")
+              IconBtn("trash", { val list = picked; chosen = emptySet(); scope.launch { list.forEach { model.remove(it) } } }, size = 20.dp, description = "Delete")
+            } else {
+              Btn("Restore", { val list = picked; chosen = emptySet(); scope.launch { list.forEach { model.restore(it) } } })
+            }
+          } else if (trashView) {
             IconBtn("back", { trashView = false })
             Text("Recently Deleted", fontSize = if (phone) 30.sp else 34.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.8).sp, maxLines = 1)
           } else {
@@ -362,9 +417,6 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
           }
         }
       }
-      if (trashView) item(span = { GridItemSpan(maxLineSpan) }) {
-        Text("Photos stay here for 30 days after you delete them, then they are removed from all your devices.", Modifier.padding(bottom = 18.dp).offset(y = (-6).dp), color = Tokens.text2)
-      }
       if (model.error.isNotEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
         Text(model.error, Modifier.padding(bottom = 14.dp), color = MaterialTheme.colorScheme.error)
       }
@@ -374,9 +426,20 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
           SectionLabel(group.optString("label"), Modifier.padding(top = if (gi == 0) 6.dp else 26.dp, bottom = 10.dp))
         }
         items(objects(group.optJSONArray("items")?.toString()), key = { it.optString("container") + "/" + it.optString("id") }) { p ->
-          Cell(p, trashView, if (phone) 3.dp else 6.dp) { open = p }
+          val k = keyOf(p)
+          Cell(p, trashView, if (phone) 3.dp else 6.dp, selecting = chosen.isNotEmpty(), selected = k in chosen,
+            onLongClick = { chosen = chosen + k },
+          ) { if (chosen.isNotEmpty()) chosen = if (k in chosen) chosen - k else chosen + k else open = p }
         }
       }
+    }
+    if (note.isNotEmpty()) {
+      Text(
+        note, fontSize = 14.sp, textAlign = TextAlign.Center,
+        modifier = Modifier.align(Alignment.BottomCenter).safeDrawingPadding().padding(20.dp).shadow(8.dp, Pill.shape).clip(Pill.shape)
+          .background(MaterialTheme.colorScheme.surface).border(1.dp, Tokens.line, Pill.shape).clickable { note = "" }.padding(horizontal = 18.dp, vertical = 10.dp),
+      )
+      LaunchedEffect(note) { if (note != "Downloading…") { kotlinx.coroutines.delay(3500); note = "" } }
     }
     model.adding?.let { (done, total) ->
       Text(
@@ -398,6 +461,7 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
       },
       onRestore = { open = null; scope.launch { model.restore(p) } },
       onDestroy = { confirm = p },
+      onDownload = { download(listOf(p)) },
     )
   }
   confirm?.let { p ->
@@ -426,7 +490,7 @@ private fun Intro(trash: Boolean, canAdd: Boolean, pick: () -> Unit) {
         Text("Nothing here", fontWeight = FontWeight.SemiBold)
       } else {
         Text("No photos yet", fontWeight = FontWeight.SemiBold)
-        Text("Add photos and videos from this device. They are kept in UUOB, on your own devices.", Modifier.padding(top = 4.dp, bottom = 18.dp).widthIn(max = 380.dp), fontSize = 13.sp, textAlign = TextAlign.Center, color = Tokens.text2)
+        Spacer(Modifier.size(18.dp))
         Btn("Add photos", pick, kind = BtnKind.Primary, lg = true, icon = "plus", enabled = canAdd)
       }
     }
@@ -434,8 +498,14 @@ private fun Intro(trash: Boolean, canAdd: Boolean, pick: () -> Unit) {
 }
 
 @Composable
-private fun Cell(p: JSONObject, trash: Boolean, radius: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
-  Box(Modifier.aspectRatio(1f).clip(RoundedCornerShape(radius)).background(Tokens.surface2).clickable(onClick = onClick)) {
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+private fun Cell(
+  p: JSONObject, trash: Boolean, radius: androidx.compose.ui.unit.Dp,
+  selecting: Boolean = false, selected: Boolean = false, onLongClick: () -> Unit = {}, onClick: () -> Unit,
+) {
+  val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
+  Box(Modifier.aspectRatio(1f).clip(RoundedCornerShape(radius)).background(Tokens.surface2)
+    .combinedClickable(onLongClick = { haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress); onLongClick() }, onClick = onClick)) {
     val thumb = thumbOf(p)
     if (thumb != null) Image(thumb, if (isVideo(p)) "Video from ${whenLabel(p.optLong("taken"))}" else "Photo from ${whenLabel(p.optLong("taken"))}", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
     else Icon24(if (isVideo(p)) "play" else "photo", Modifier.align(Alignment.Center), size = 28.dp, tint = Tokens.text3)
@@ -453,6 +523,15 @@ private fun Cell(p: JSONObject, trash: Boolean, radius: androidx.compose.ui.unit
         Text(badge, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
       }
     }
+    if (selecting) {
+      if (selected) Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.25f)))
+      Box(
+        Modifier.align(Alignment.TopEnd).padding(6.dp).size(22.dp).clip(CircleShape)
+          .background(if (selected) MaterialTheme.colorScheme.primary else Color.Black.copy(alpha = 0.25f))
+          .border(1.5.dp, Color.White, CircleShape),
+        contentAlignment = Alignment.Center,
+      ) { if (selected) Icon24("check", size = 14.dp, stroke = 2.6f, tint = Color.White) }
+    }
   }
 }
 
@@ -461,6 +540,7 @@ private fun Cell(p: JSONObject, trash: Boolean, radius: androidx.compose.ui.unit
 private fun Viewer(
   p: JSONObject, shown: List<JSONObject>,
   onShow: (JSONObject) -> Unit, onClose: () -> Unit, onDelete: () -> Unit, onRestore: () -> Unit, onDestroy: () -> Unit,
+  onDownload: () -> Unit,
 ) {
   val i = shown.indexOfFirst { it.optString("id") == p.optString("id") && it.optString("container") == p.optString("container") }
   fun step(by: Int) = shown.getOrNull(i + by)?.let(onShow)
@@ -489,6 +569,7 @@ private fun Viewer(
           Btn("Restore", onRestore)
           Btn("Delete", onDestroy, kind = BtnKind.Danger)
         } else {
+          IconBtn("download", onDownload, size = 20.dp, tint = Color.White, description = "Download")
           IconBtn("trash", onDelete, size = 20.dp, tint = Color.White)
         }
       }
