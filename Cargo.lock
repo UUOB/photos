@@ -2962,7 +2962,7 @@ dependencies = [
 
 [[package]]
 name = "photos-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "jiff",
@@ -2973,7 +2973,7 @@ dependencies = [
 
 [[package]]
 name = "photos-linux"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "photos-core",
  "relm4",
