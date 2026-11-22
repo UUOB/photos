@@ -510,7 +510,7 @@ struct InfoPanel: View {
                 IconRow(r.icon.string, last: i == rows.count - 1) {
                     Text(r.label.string).foregroundStyle(Look.text2)
                     Spacer(minLength: 16)
-                    Text(r.value.string).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                    Text(r["value"].string).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
                 }
             }
         }
