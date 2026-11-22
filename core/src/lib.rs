@@ -98,6 +98,76 @@ pub fn days_left(deleted: i64, now: i64) -> i64 {
     ((left as f64 / DAY as f64).ceil() as i64).max(1)
 }
 
+/// A size in bytes for people: "840 KB", "2.4 MB".
+#[uniffi::export]
+pub fn size_label(bytes: i64) -> String {
+    let b = bytes.max(0) as f64;
+    if b < 1000.0 {
+        format!("{} bytes", b as i64)
+    } else if b < 1e6 {
+        format!("{} KB", (b / 1e3).round() as i64)
+    } else if b < 1e9 {
+        format!("{:.1} MB", b / 1e6)
+    } else {
+        format!("{:.1} GB", b / 1e9)
+    }
+}
+
+/// What a photo's details panel lists, as rows `[{ icon, label, value }]`:
+/// its name, when it was taken and added, kind, size, dimensions, length.
+#[uniffi::export]
+pub fn details(record: String) -> String {
+    let r: Json = serde_json::from_str(&record).unwrap_or_default();
+    let mut rows = vec![];
+    let mut row = |icon: &str, label: &str, value: String| {
+        if !value.is_empty() {
+            rows.push(serde_json::json!({ "icon": icon, "label": label, "value": value }));
+        }
+    };
+    row("photo", "Name", r["name"].as_str().unwrap_or("").to_string());
+    if let Some(t) = r["taken"].as_i64() {
+        row("calendar", "Taken", when_label(t));
+    }
+    let kind = r["type"].as_str().unwrap_or("");
+    let ext = kind.split('/').nth(1).unwrap_or("").split(['+', ';']).next().unwrap_or("").to_uppercase();
+    row("list", "Kind", if kind.is_empty() { String::new() } else if is_video(&r) { format!("{ext} video") } else { format!("{ext} image") });
+    if let Some(b) = r["size"].as_i64() {
+        row("download", "Size", size_label(b));
+    }
+    if let (Some(w), Some(h)) = (r["w"].as_i64(), r["h"].as_i64()) {
+        row("photo", "Dimensions", format!("{w} × {h}"));
+    }
+    if let Some(d) = r["duration"].as_f64() {
+        row("play", "Length", duration_label(d));
+    }
+    if let Some(a) = r["added"].as_i64() {
+        row("plus", "Added", when_label(a));
+    }
+    Json::Array(rows).to_string()
+}
+
+/// The file name to save a photo as: its own name, or one from when it was
+/// taken with the extension its kind has ("Photo 2026-11-20 16.30.jpg").
+#[uniffi::export]
+pub fn save_name(record: String) -> String {
+    let r: Json = serde_json::from_str(&record).unwrap_or_default();
+    if let Some(n) = r["name"].as_str().filter(|n| !n.trim().is_empty()) {
+        return n.replace(['/', '\\'], "-");
+    }
+    let ext = match r["type"].as_str().unwrap_or("") {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/heic" => "heic",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "video/quicktime" => "mov",
+        t if t.starts_with("video/") => "mp4",
+        _ => "jpg",
+    };
+    let z = zoned(r["taken"].as_i64().unwrap_or(0));
+    format!("{} {:04}-{:02}-{:02} {:02}.{:02}.{ext}", if is_video(&r) { "Video" } else { "Photo" }, z.year(), z.month(), z.day(), z.hour(), z.minute())
+}
+
 pub fn is_video(r: &Json) -> bool {
     r["type"].as_str().is_some_and(|t| t.starts_with("video/"))
 }
@@ -274,5 +344,24 @@ mod tests {
         let back: Json = serde_json::from_str(&mark_deleted(d.to_string(), 0)).unwrap();
         assert_eq!(back, json!({ "id": "x", "taken": 1 }));
         assert_eq!(thumb_bytes(jpeg_data_url(vec![1, 2, 3])), vec![1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod details_tests {
+    use super::*;
+
+    #[test]
+    fn sizes_names_and_details() {
+        assert_eq!(size_label(512), "512 bytes");
+        assert_eq!(size_label(840_000), "840 KB");
+        assert_eq!(size_label(2_400_000), "2.4 MB");
+        assert_eq!(save_name(r#"{"name":"IMG_1.HEIC","type":"image/heic"}"#.into()), "IMG_1.HEIC");
+        assert!(save_name(r#"{"type":"video/mp4","taken":0}"#.into()).starts_with("Video 19"));
+        let d: Json = serde_json::from_str(&details(r#"{"name":"a.jpg","type":"image/jpeg","size":2400000,"w":4032,"h":3024}"#.into())).unwrap();
+        let labels: Vec<&str> = d.as_array().unwrap().iter().map(|r| r["label"].as_str().unwrap()).collect();
+        assert_eq!(labels, ["Name", "Kind", "Size", "Dimensions"]);
+        assert_eq!(d[1]["value"], "JPEG image");
+        assert_eq!(d[3]["value"], "4032 × 3024");
     }
 }

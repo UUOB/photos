@@ -105,6 +105,7 @@ import app.uuob.kit.BtnKind
 import app.uuob.kit.Colors
 import app.uuob.kit.Icon24
 import app.uuob.kit.IconBtn
+import app.uuob.kit.IconRow
 import app.uuob.kit.Pill
 import app.uuob.kit.SectionLabel
 import app.uuob.kit.Tokens
@@ -117,6 +118,8 @@ import app.uuob.kit.json
 import app.uuob.kit.objects
 import app.uuob.kit.userMessage
 import app.uuob.photos.core.daysLeft
+import app.uuob.photos.core.details
+import app.uuob.photos.core.saveName
 import app.uuob.photos.core.durationLabel
 import app.uuob.photos.core.expired
 import app.uuob.photos.core.gallery
@@ -310,6 +313,25 @@ class PhotosModel(private val ctx: Context) {
     saved
   }
 
+  /** Hands the originals to another app (the phone's share sheet). False when none could be read. */
+  suspend fun share(list: List<JSONObject>): Boolean {
+    val uris = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+      val dir = File(ctx.cacheDir, "shared").apply { deleteRecursively(); mkdirs() }
+      list.mapNotNull { p ->
+        val bytes = runCatching { client.readFile(p.optString("container"), p.optString("file")) }.getOrNull() ?: return@mapNotNull null
+        val f = File(dir, saveName(p.toString())).apply { writeBytes(bytes) }
+        androidx.core.content.FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)
+      }
+    }
+    if (uris.isEmpty()) return false
+    val type = if (list.all { isVideo(it) }) "video/*" else if (list.none { isVideo(it) }) "image/*" else "*/*"
+    val send = if (uris.size == 1) android.content.Intent(android.content.Intent.ACTION_SEND).putExtra(android.content.Intent.EXTRA_STREAM, uris[0])
+      else android.content.Intent(android.content.Intent.ACTION_SEND_MULTIPLE).putParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM, ArrayList(uris))
+    send.setType(type).addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    ctx.startActivity(android.content.Intent.createChooser(send, null).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+    return true
+  }
+
   suspend fun destroy(p: JSONObject) {
     val c = p.optString("container")
     runCatching { client.deleteFile(c, p.optString("file")) }
@@ -366,6 +388,10 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
     val n = model.download(list)
     note = if (n == list.size) "Saved to your gallery" else "Saved $n of ${list.size}: the rest are on a device that can’t be reached"
   }
+  fun share(list: List<JSONObject>) = scope.launch {
+    if (!model.share(list)) note = "The original is on a storage device that can’t be reached right now."
+  }
+  var info by remember { mutableStateOf<JSONObject?>(null) }
   val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
     if (uris.isNotEmpty()) scope.launch { model.add(uris) }
   }
@@ -399,6 +425,7 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
             IconBtn("close", { chosen = emptySet() })
             Text("${chosen.size} selected", fontSize = if (phone) 26.sp else 30.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.6).sp, maxLines = 1, modifier = Modifier.weight(1f))
             if (!trashView) {
+              IconBtn("share", { share(picked); chosen = emptySet() }, size = 20.dp, description = "Share")
               IconBtn("download", { download(picked); chosen = emptySet() }, size = 20.dp, description = "Download")
               IconBtn("trash", { val list = picked; chosen = emptySet(); scope.launch { list.forEach { model.remove(it) } } }, size = 20.dp, description = "Delete")
             } else {
@@ -462,7 +489,26 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
       onRestore = { open = null; scope.launch { model.restore(p) } },
       onDestroy = { confirm = p },
       onDownload = { download(listOf(p)) },
+      onShare = { share(listOf(p)) },
+      onInfo = { info = p },
     )
+  }
+  // A photo's details, in the event card's style.
+  info?.let { p ->
+    WebSheet({ info = null }, padding = 22.dp) {
+      Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Info", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.4).sp, modifier = Modifier.weight(1f))
+        IconBtn("close", { info = null }, size = 19.dp)
+      }
+      val rows = objects(details(p.toString()))
+      rows.forEachIndexed { i, r ->
+        IconRow(r.optString("icon"), last = i == rows.size - 1) {
+          Text(r.optString("label"), fontSize = 15.sp, color = Tokens.text2)
+          Spacer(Modifier.weight(1f))
+          Text(r.optString("value"), fontSize = 15.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.MiddleEllipsis)
+        }
+      }
+    }
   }
   confirm?.let { p ->
     val what = if (isVideo(p)) "video" else "photo"
@@ -541,6 +587,8 @@ private fun Viewer(
   p: JSONObject, shown: List<JSONObject>,
   onShow: (JSONObject) -> Unit, onClose: () -> Unit, onDelete: () -> Unit, onRestore: () -> Unit, onDestroy: () -> Unit,
   onDownload: () -> Unit,
+  onShare: () -> Unit,
+  onInfo: () -> Unit,
 ) {
   val i = shown.indexOfFirst { it.optString("id") == p.optString("id") && it.optString("container") == p.optString("container") }
   fun step(by: Int) = shown.getOrNull(i + by)?.let(onShow)
@@ -569,6 +617,8 @@ private fun Viewer(
           Btn("Restore", onRestore)
           Btn("Delete", onDestroy, kind = BtnKind.Danger)
         } else {
+          IconBtn("info", onInfo, size = 20.dp, tint = Color.White, description = "Info")
+          IconBtn("share", onShare, size = 20.dp, tint = Color.White, description = "Share")
           IconBtn("download", onDownload, size = 20.dp, tint = Color.White, description = "Download")
           IconBtn("trash", onDelete, size = 20.dp, tint = Color.White)
         }

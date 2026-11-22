@@ -32,7 +32,7 @@ fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Msg {
     Reload,
     Trash(bool),
@@ -47,6 +47,14 @@ pub enum Msg {
     Close,
     /// The window's width changed (phones get three columns).
     Width(i32),
+    /// Save the original wherever the user picks (the photo shown when None).
+    Save(Option<Value>),
+    /// Copy the picture to the clipboard.
+    Copy(Option<Value>),
+    /// The photo's details.
+    Info(Option<Value>),
+    /// A short note at the bottom ("Saved", "Copied").
+    Note(String),
 }
 
 #[derive(Debug)]
@@ -89,6 +97,7 @@ pub struct Widgets {
     progress: gtk::Label,
     pages: gtk::Stack,
     viewer: Viewer,
+    toasts: adw::ToastOverlay,
 }
 
 /// The full-size view of one photo or video.
@@ -103,6 +112,8 @@ pub struct Viewer {
     destroy: gtk::Button,
     prev: gtk::Button,
     next: gtk::Button,
+    save: gtk::Button,
+    copy: gtk::Button,
 }
 
 fn texture_of(thumb: &str) -> Option<gdk::Texture> {
@@ -195,7 +206,6 @@ impl Photos {
             page.append(&gtk::Label::builder().label("Nothing here").css_classes(["headline"]).build());
         } else {
             page.append(&gtk::Label::builder().label("No photos yet").css_classes(["headline"]).build());
-            page.append(&gtk::Label::builder().label("Add photos and videos from this device. They are kept in UUOB, on your own devices.").wrap(true).justify(gtk::Justification::Center).width_chars(12).max_width_chars(48).css_classes(["caption-web", "intro-text"]).build());
             let add = uuob_kit_gtk::btn("Add photos", Some("plus"), &["primary", "lg"]);
             add.set_halign(gtk::Align::Center);
             add.set_sensitive(self.adding.is_none());
@@ -233,6 +243,40 @@ impl Photos {
         }
         let what = if is_video(p) { "Video" } else { "Photo" };
         let button = gtk::Button::builder().child(&overlay).css_classes(["flat", "cell-button"]).tooltip_text(format!("{what} from {}", core::when_label(p["taken"].as_i64().unwrap_or(0)))).build();
+        // Right-click (or a long press): what the viewer offers, without opening it.
+        let menu = gtk::Popover::builder().has_arrow(false).css_classes(["web-menu-pop"]).build();
+        menu.set_parent(&button);
+        let items = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+        let choices: Vec<(&str, Msg)> = if self.trash {
+            vec![("Open", Msg::Open(Some(p.clone()))), ("Restore", Msg::Restore(p.clone())), ("Delete forever…", Msg::Confirm(p.clone()))]
+        } else {
+            let mut c = vec![("Open", Msg::Open(Some(p.clone()))), ("Save…", Msg::Save(Some(p.clone())))];
+            if !is_video(p) {
+                c.push(("Copy", Msg::Copy(Some(p.clone()))));
+            }
+            c.push(("Info", Msg::Info(Some(p.clone()))));
+            c.push(("Delete", Msg::Remove(p.clone())));
+            c
+        };
+        for (label, msg) in choices {
+            let b = gtk::Button::builder().child(&gtk::Label::builder().label(label).xalign(0.0).build()).css_classes(["web-menu-item"]).build();
+            let (s, m) = (sender.clone(), menu.clone());
+            b.connect_clicked(move |_| {
+                m.popdown();
+                s.input(msg.clone());
+            });
+            items.append(&b);
+        }
+        menu.set_child(Some(&items));
+        let right = gtk::GestureClick::builder().button(3).build();
+        {
+            let menu = menu.clone();
+            right.connect_pressed(move |_, _, x, y| {
+                menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                menu.popup();
+            });
+        }
+        button.add_controller(right);
         let sender = sender.clone();
         let p = p.clone();
         button.connect_clicked(move |_| sender.input(Msg::Open(Some(p.clone()))));
@@ -245,6 +289,9 @@ impl Photos {
         v.when.set_title(&core::when_label(p["taken"].as_i64().unwrap_or(0)));
         let deleted = !p["deleted"].is_null();
         v.delete.set_visible(!deleted);
+        v.save.set_visible(!deleted);
+        // A video can be saved, not copied as a picture.
+        v.copy.set_visible(!deleted && !is_video(p));
         v.restore.set_visible(deleted);
         v.destroy.set_visible(deleted);
         let shown = self.shown();
@@ -368,7 +415,11 @@ async fn futures_select<T>(a: impl std::future::Future<Output = Option<T>>, b: i
 fn style() {
     let css = gtk::CssProvider::new();
     css.load_from_string(
-        ".grid-page { padding: 6px 32px 48px; }
+        "popover.web-menu-pop > contents { background: @uuob_surface2; border: 1px solid alpha(@window_fg_color, 0.14); border-radius: 14px; padding: 6px; box-shadow: 0 12px 32px rgba(0,0,0,0.2); }
+         button.web-menu-item { min-height: 36px; padding: 0 12px; border-radius: 9px; background: none; box-shadow: none; font-size: 15px; font-weight: 500; min-width: 160px; }
+         button.web-menu-item > label { margin: 0; }
+         button.web-menu-item:hover { background: alpha(@window_fg_color, 0.06); }
+         .grid-page { padding: 6px 32px 48px; }
          .grid-page.narrow { padding: 0 12px 32px; }
          .grid-page.narrow .large-title { font-size: 30px; }
          .grid-page.narrow .cell, .grid-page.narrow .cell-button { border-radius: 3px; }
@@ -483,10 +534,20 @@ impl relm4::Component for Photos {
         restore.set_valign(gtk::Align::Center);
         let destroy = uuob_kit_gtk::btn("Delete", None, &["danger"]);
         destroy.set_valign(gtk::Align::Center);
+        let save = white("download", 20, "Save… (Ctrl+S)");
+        let copy = white("copy", 20, "Copy (Ctrl+C)");
+        let info_b = white("info", 20, "Info (I)");
         vheader.pack_start(&close);
         vheader.pack_end(&destroy);
         vheader.pack_end(&restore);
         vheader.pack_end(&delete);
+        vheader.pack_end(&save);
+        vheader.pack_end(&copy);
+        vheader.pack_end(&info_b);
+        for (b, m) in [(&save, 0), (&copy, 1), (&info_b, 2)] {
+            let s = sender.clone();
+            b.connect_clicked(move |_| s.input(match m { 0 => Msg::Save(None), 1 => Msg::Copy(None), _ => Msg::Info(None) }));
+        }
         let preview = gtk::Picture::builder().content_fit(gtk::ContentFit::Contain).build();
         let picture = gtk::Picture::builder().content_fit(gtk::ContentFit::Contain).build();
         let video = gtk::Video::builder().autoplay(true).build();
@@ -546,19 +607,24 @@ impl relm4::Component for Photos {
         pages.add_named(&grid, Some("grid"));
         pages.add_named(&viewer_view, Some("viewer"));
 
-        // Keys in the viewer: Escape, ←, →.
+        // Keys in the viewer: Escape, ←, →, Ctrl+S, Ctrl+C, Delete, I.
         let keys = gtk::EventControllerKey::new();
         keys.connect_key_pressed({
             let s = sender.clone();
             let pages = pages.clone();
-            move |_, key, _, _| {
+            move |_, key, _, mods| {
                 if pages.visible_child_name().as_deref() != Some("viewer") {
                     return glib::Propagation::Proceed;
                 }
+                let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
                 match key {
                     gdk::Key::Escape => s.input(Msg::Close),
                     gdk::Key::Right => s.input(Msg::Step(1)),
                     gdk::Key::Left => s.input(Msg::Step(-1)),
+                    gdk::Key::s if ctrl => s.input(Msg::Save(None)),
+                    gdk::Key::c if ctrl => s.input(Msg::Copy(None)),
+                    gdk::Key::Delete => s.input(Msg::Remove(Value::Null)),
+                    gdk::Key::i => s.input(Msg::Info(None)),
                     _ => return glib::Propagation::Proceed,
                 }
                 glib::Propagation::Stop
@@ -570,7 +636,9 @@ impl relm4::Component for Photos {
             let s = sender.clone();
             move || s.input(Msg::Reload)
         });
-        gate.set_content(&pages);
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&pages));
+        gate.set_content(&toasts);
         root.set_content(Some(&gate.widget()));
         std::mem::forget(gate);
 
@@ -587,8 +655,8 @@ impl relm4::Component for Photos {
 
         let all = client.cached_all("photos");
         let model = Photos { client, months: vec![], all, trash: false, open: None, adding: None, error: String::new(), made: HashMap::new(), purged: false, width: 1100 };
-        let viewer = Viewer { when, stage, preview, picture, video, delete, restore, destroy, prev, next };
-        let widgets = Widgets { title, count, column: column.clone(), back, trash, add, lead, error, groups, progress, pages, viewer };
+        let viewer = Viewer { when, stage, preview, picture, video, delete, restore, destroy, prev, next, save, copy };
+        let widgets = Widgets { title, count, column: column.clone(), back, trash, add, lead, error, groups, progress, pages, viewer, toasts };
         model.render(&widgets, &sender);
         // Narrow windows lay the grid out as the web version did on phones.
         root.add_tick_callback({
@@ -702,12 +770,17 @@ impl relm4::Component for Photos {
                     tx.oneshot_command(std::future::ready(Cmd::Done));
                 });
             }
-            Msg::Remove(_) => {
-                let p = current();
-                // Deleting moves a photo to Recently Deleted; on to the next one, or close.
-                self.open = self.step(1);
-                if self.open.is_some() {
-                    self.show(w, &sender);
+            Msg::Remove(arg) => {
+                let p = if arg.is_null() { current() } else { arg };
+                if p.is_null() {
+                    return;
+                }
+                // Deleting the photo shown moves a photo to Recently Deleted and goes on to the next one, or closes.
+                if self.open.as_ref().is_some_and(|o| o["id"] == p["id"]) {
+                    self.open = self.step(1);
+                    if self.open.is_some() {
+                        self.show(w, &sender);
+                    }
                 }
                 let client = self.client.clone();
                 sender.oneshot_command(async move {
@@ -716,8 +789,8 @@ impl relm4::Component for Photos {
                     Cmd::Done
                 });
             }
-            Msg::Restore(_) => {
-                let p = current();
+            Msg::Restore(arg) => {
+                let p = if arg.is_null() { current() } else { arg };
                 self.open = None;
                 let client = self.client.clone();
                 sender.oneshot_command(async move {
@@ -726,8 +799,8 @@ impl relm4::Component for Photos {
                     Cmd::Done
                 });
             }
-            Msg::Confirm(_) => {
-                let p = current();
+            Msg::Confirm(arg) => {
+                let p = if arg.is_null() { current() } else { arg };
                 let what = if is_video(&p) { "video" } else { "photo" };
                 let s = sender.clone();
                 let dialog = uuob_kit_gtk::confirm_sheet(&format!("Delete this {what}?"), "It is removed from all your devices. This can’t be undone.", &[("Cancel", &[], "cancel"), ("Delete", &["danger"], "delete")], false, move |r| {
@@ -736,6 +809,66 @@ impl relm4::Component for Photos {
                     }
                 });
                 dialog.present(Some(root));
+                return;
+            }
+            Msg::Note(t) => {
+                w.toasts.add_toast(adw::Toast::builder().title(&t).timeout(3).build());
+                return;
+            }
+            Msg::Save(p) => {
+                let p = p.unwrap_or_else(current);
+                let dialog = gtk::FileDialog::builder().title("Save").initial_name(core::save_name(p.to_string())).build();
+                let (client, tx) = (self.client.clone(), sender.clone());
+                dialog.save(Some(root), None::<&gio::Cancellable>, move |r| {
+                    let Ok(file) = r else { return };
+                    let Some(path) = file.path() else { return };
+                    glib::spawn_future_local(async move {
+                        let note = match client.read_file(Some(s(&p, "container")), s(&p, "file")).await {
+                            Ok(bytes) => match std::fs::write(&path, bytes) {
+                                Ok(()) => "Saved".to_string(),
+                                Err(e) => format!("Couldn’t save: {e}"),
+                            },
+                            Err(_) => "The original is on a storage device that can’t be reached right now.".to_string(),
+                        };
+                        tx.input(Msg::Note(note));
+                    });
+                });
+                return;
+            }
+            Msg::Copy(p) => {
+                let p = p.unwrap_or_else(current);
+                let (client, tx, clip) = (self.client.clone(), sender.clone(), root.clipboard());
+                glib::spawn_future_local(async move {
+                    let note = match client.read_file(Some(s(&p, "container")), s(&p, "file")).await {
+                        Ok(bytes) => match gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
+                            Ok(t) => {
+                                clip.set_texture(&t);
+                                "Copied".to_string()
+                            }
+                            Err(_) => "This picture can’t be copied.".to_string(),
+                        },
+                        Err(_) => "The original is on a storage device that can’t be reached right now.".to_string(),
+                    };
+                    tx.input(Msg::Note(note));
+                });
+                return;
+            }
+            Msg::Info(p) => {
+                let p = p.unwrap_or_else(current);
+                let rows: Vec<Value> = serde_json::from_str(&core::details(p.to_string())).unwrap_or_default();
+                let col = gtk::Box::builder().orientation(gtk::Orientation::Vertical).margin_start(20).margin_end(20).margin_bottom(16).build();
+                for (i, r) in rows.iter().enumerate() {
+                    let value = gtk::Label::builder().label(s(r, "value")).selectable(true).ellipsize(gtk::pango::EllipsizeMode::Middle).xalign(1.0).build();
+                    let row = uuob_kit_gtk::icon_setting_row(Some(s(r, "icon")), s(r, "label"), &value);
+                    if i + 1 == rows.len() {
+                        row.add_css_class("last");
+                    }
+                    col.append(&row);
+                }
+                let view = adw::ToolbarView::new();
+                view.add_top_bar(&adw::HeaderBar::new());
+                view.set_content(Some(&col));
+                adw::Dialog::builder().title("Info").content_width(380).child(&view).build().present(Some(root));
                 return;
             }
             Msg::Destroy(p) => {

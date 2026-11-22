@@ -23,7 +23,7 @@ struct PhotosApp: App {
     var body: some Scene {
         WindowGroup("Photos") {
             Gate(uuob: model.uuob, updater: updater) { PhotosView(model: model, updater: updater) }
-                .frame(minWidth: 560, minHeight: 560)
+                .frame(minWidth: 360, minHeight: 420)
                 .background(Look.bg)
         }
         // No title bar: the page is the window, as on the web.
@@ -145,6 +145,60 @@ final class PhotosModel {
         _ = try? await client.delete(collection: "photos", container: p.container.string, id: p.id)
     }
 
+    // MARK: The original: save, copy, share
+
+    /// What the user is told after saving or copying (shown for a moment).
+    var note = ""
+
+    private func original(_ p: J) async -> Data? {
+        guard let bytes = try? await client.readFile(container: p.container.string, id: p.file.string) else {
+            note = "The original is on a storage device that can’t be reached right now."
+            return nil
+        }
+        return Data(bytes)
+    }
+
+    /// Save the original wherever the user picks (⌘S).
+    func save(_ p: J) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = saveName(record: p.text)
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            guard let data = await original(p) else { return }
+            do { try data.write(to: url); note = "Saved" } catch { note = "Couldn’t save: \(error.localizedDescription)" }
+        }
+    }
+
+    /// Copy the picture, to paste into another app (⌘C); a video is copied as its file.
+    func copy(_ p: J) {
+        Task {
+            guard let data = await original(p) else { return }
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            if p.type.string.hasPrefix("video/") {
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent(saveName(record: p.text))
+                try? data.write(to: url)
+                pb.writeObjects([url as NSURL])
+            } else if let image = NSImage(data: data) {
+                pb.writeObjects([image])
+            }
+            note = "Copied"
+        }
+    }
+
+    /// The Mac's share menu (AirDrop, Messages, Mail…) for the original.
+    func share(_ p: J) {
+        Task {
+            guard let data = await original(p) else { return }
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent(saveName(record: p.text))
+            try? data.write(to: url)
+            guard let view = NSApp.keyWindow?.contentView else { return }
+            let anchor = NSRect(x: view.bounds.maxX - 140, y: view.bounds.maxY - 60, width: 1, height: 1)
+            NSSharingServicePicker(items: [url]).show(relativeTo: anchor, of: view, preferredEdge: .minY)
+        }
+    }
+
     func step(_ by: Int) {
         guard let p = open, let i = shown.firstIndex(where: { $0.id == p.id && $0.container == p.container }) else { return }
         let j = i + by
@@ -228,6 +282,16 @@ struct PhotosView: View {
             }
             // The viewer covers the whole window, black, as on the web.
             if let p = model.open { Viewer(model: model, p: p).transition(.opacity) }
+            // "Saved", "Copied" after the right-click menu (the viewer shows its own).
+            if model.open == nil && !model.note.isEmpty {
+                VStack {
+                    Spacer()
+                    Text(model.note).font(.system(size: 14, weight: .medium))
+                        .padding(.horizontal, 16).padding(.vertical, 9).background(Look.elevated, in: Capsule())
+                        .shadow(radius: 8).padding(.bottom, 24)
+                        .task(id: model.note) { try? await Task.sleep(for: .seconds(2.5)); model.note = "" }
+                }
+            }
         }
         .ignoresSafeArea(.container, edges: .top)
         .foregroundStyle(Look.text)
@@ -260,7 +324,7 @@ struct PhotosView: View {
             UpdateButton(updater: updater)
             if !model.trash {
                 if g.trash.int > 0 { IconButton("trash", size: 20, help: "Recently deleted") { model.trash = true } }
-                Button { model.pick() } label: { IconLabel("plus", "Add") }.buttonStyle(UuobButton(.primary)).disabled(model.adding != nil)
+                Button { model.pick() } label: { IconLabel("plus", "Add") }.buttonStyle(UuobButton(.primary)).disabled(model.adding != nil).fixedSize()
             }
         }
         .padding(.bottom, 18)
@@ -275,8 +339,7 @@ struct PhotosView: View {
                 Text("Nothing here").font(.system(size: 17, weight: .semibold))
             } else {
                 Text("No photos yet").font(.system(size: 17, weight: .semibold))
-                Text("Add photos and videos from this device. They are kept in UUOB, on your own devices.")
-                    .font(.system(size: 13)).foregroundStyle(Look.text2).multilineTextAlignment(.center).frame(maxWidth: 380).padding(.top, 4).padding(.bottom, 18)
+                Spacer().frame(height: 18)
                 Button { model.pick() } label: { IconLabel("plus", "Add photos") }.buttonStyle(UuobButton(.primary, large: true)).disabled(model.adding != nil)
             }
         }
@@ -307,6 +370,20 @@ struct PhotosView: View {
         }
         .buttonStyle(.plain)
         .help("\(video ? "Video" : "Photo") from \(whenLabel(ms: p.taken.int64))")
+        // Right-click (or Control-click): what the viewer offers, without opening it.
+        .contextMenu {
+            Button("Open") { model.open = p }
+            if p.deleted.isNull {
+                Button("Save…") { model.save(p) }
+                Button("Copy") { model.copy(p) }
+                Button("Share…") { model.share(p) }
+                Divider()
+                Button("Delete") { Task { await model.remove(p) } }
+            } else {
+                Button("Restore") { Task { await model.restore(p) } }
+                Button("Delete Forever…") { model.confirm = p }
+            }
+        }
     }
 
     /// `.badge`: a dark pill in the corner.
@@ -327,6 +404,7 @@ struct Viewer: View {
     @State private var image: NSImage?
     @State private var player: AVPlayer?
     @State private var missing = false
+    @State private var info = false
 
     var body: some View {
         let video = p.type.string.hasPrefix("video/")
@@ -334,17 +412,22 @@ struct Viewer: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Button { model.open = nil } label: { Ico("close", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut(.cancelAction).help("Close")
-                Text(whenLabel(ms: p.taken.int64)).font(.system(size: 15)).foregroundStyle(.white.opacity(0.8))
+                Text(whenLabel(ms: p.taken.int64)).font(.system(size: 15)).foregroundStyle(.white.opacity(0.8)).lineLimit(1).truncationMode(.tail)
                 Spacer()
+                Button { info.toggle() } label: { Ico("info", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("i").help("Info (⌘I)")
+                    .popover(isPresented: $info, arrowEdge: .bottom) { InfoPanel(p: p) }
                 if !p.deleted.isNull {
                     Button("Restore") { model.open = nil; Task { await model.restore(p) } }.buttonStyle(UuobButton())
                     Button("Delete") { model.confirm = p }.buttonStyle(UuobButton(.danger))
                 } else {
+                    Button { model.share(p) } label: { Ico("share", size: 20) }.buttonStyle(OnBlack()).help("Share")
+                    Button { model.copy(p) } label: { Ico("copy", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("c").help("Copy (⌘C)")
+                    Button { model.save(p) } label: { Ico("download", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("s").help("Save… (⌘S)")
                     Button {
                         let next = model.shown.indices.contains(i + 1) ? model.shown[i + 1] : nil
                         model.open = next
                         Task { await model.remove(p) }
-                    } label: { Ico("trash", size: 20) }.buttonStyle(OnBlack()).help("Delete")
+                    } label: { Ico("trash", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut(.delete, modifiers: []).help("Delete (⌫)")
                 }
             }
             // Below the window's own buttons, which sit over the top left.
@@ -373,6 +456,14 @@ struct Viewer: View {
         }
         .background(Color.black)
         .foregroundStyle(.white)
+        .overlay(alignment: .bottom) {
+            if !model.note.isEmpty {
+                Text(model.note).font(.system(size: 14, weight: .medium)).foregroundStyle(.white)
+                    .padding(.horizontal, 16).padding(.vertical, 9).background(.black.opacity(0.75), in: Capsule())
+                    .padding(.bottom, 24)
+                    .task(id: model.note) { try? await Task.sleep(for: .seconds(2.5)); model.note = "" }
+            }
+        }
         .task(id: p.text) {
             image = nil; player = nil; missing = false
             if video {
@@ -406,6 +497,26 @@ struct Viewer: View {
             configuration.label.foregroundStyle(.white).frame(width: 44, height: 44)
                 .background(.black.opacity(configuration.isPressed ? 0.6 : 0.4), in: Circle()).contentShape(Circle())
         }
+    }
+}
+
+/// A photo's details, in the event card's style: an icon and a line each.
+struct InfoPanel: View {
+    let p: J
+    var body: some View {
+        let rows = J(text: details(record: p.text)).array
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { i, r in
+                IconRow(r.icon.string, last: i == rows.count - 1) {
+                    Text(r.label.string).foregroundStyle(Look.text2)
+                    Spacer(minLength: 16)
+                    Text(r.value.string).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                }
+            }
+        }
+        .padding(.horizontal, 18).padding(.vertical, 8)
+        .frame(width: 340)
+        .foregroundStyle(Look.text)
     }
 }
 
