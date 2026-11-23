@@ -181,11 +181,28 @@ pub fn gallery(records_json: String, trash: bool) -> String {
 }
 
 pub fn gallery_of(all: &[Json], trash: bool) -> Json {
+    view_of(all, if trash { "trash" } else { "all" })
+}
+
+/// The grid of one place of the sidebar: `view` "all" (every photo and
+/// video), "videos" or "trash" (the deleted ones), grouped by month as
+/// `gallery`, plus how many each place has: `{ groups, photos, videos, trash }`.
+#[uniffi::export]
+pub fn gallery_view(records_json: String, view: String) -> String {
+    view_of(&records(&records_json), &view).to_string()
+}
+
+pub fn view_of(all: &[Json], view: &str) -> Json {
     let mut photos: Vec<&Json> = all.iter().filter(|p| p["deleted"].is_null()).collect();
     let mut deleted: Vec<&Json> = all.iter().filter(|p| !p["deleted"].is_null()).collect();
     photos.sort_by(|a, b| num(b, "taken").total_cmp(&num(a, "taken")));
     deleted.sort_by(|a, b| num(b, "deleted").total_cmp(&num(a, "deleted")));
-    let shown = if trash { &deleted } else { &photos };
+    let videos: Vec<&Json> = photos.iter().copied().filter(|p| is_video(p)).collect();
+    let shown = match view {
+        "trash" => &deleted,
+        "videos" => &videos,
+        _ => &photos,
+    };
     let mut groups: Vec<(String, Vec<Json>)> = vec![];
     for p in shown {
         let key = month_of(num(p, "taken") as i64);
@@ -195,7 +212,7 @@ pub fn gallery_of(all: &[Json], trash: bool) -> Json {
         }
     }
     let groups: Vec<Json> = groups.into_iter().map(|(month, items)| json!({ "label": month_label(month.clone()), "month": month, "items": items })).collect();
-    json!({ "groups": groups, "photos": photos.len(), "trash": deleted.len() })
+    json!({ "groups": groups, "photos": photos.len(), "videos": videos.len(), "trash": deleted.len() })
 }
 
 /// The photos deleted so long ago that they go for good now.
@@ -344,6 +361,20 @@ mod tests {
         let back: Json = serde_json::from_str(&mark_deleted(d.to_string(), 0)).unwrap();
         assert_eq!(back, json!({ "id": "x", "taken": 1 }));
         assert_eq!(thumb_bytes(jpeg_data_url(vec![1, 2, 3])), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn videos_view_keeps_only_videos() {
+        let all = vec![
+            json!({ "id": "p", "taken": 2, "type": "image/jpeg" }),
+            json!({ "id": "v", "taken": 1, "type": "video/mp4" }),
+            json!({ "id": "gone", "taken": 3, "type": "video/mp4", "deleted": 5 }),
+        ];
+        let g = view_of(&all, "videos");
+        let ids: Vec<&str> = g["groups"][0]["items"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["v"]);
+        assert_eq!((g["photos"].as_u64(), g["videos"].as_u64(), g["trash"].as_u64()), (Some(2), Some(1), Some(1)));
+        assert_eq!(view_of(&all, "trash")["groups"][0]["items"][0]["id"], json!("gone"));
     }
 }
 

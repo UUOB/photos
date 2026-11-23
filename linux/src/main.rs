@@ -35,7 +35,9 @@ fn now() -> i64 {
 #[derive(Clone, Debug)]
 pub enum Msg {
     Reload,
-    Trash(bool),
+    /// A place of the sidebar: "all", "videos" or "trash".
+    Show(String),
+    Settings,
     Open(Option<Value>),
     Step(i32),
     Pick,
@@ -75,7 +77,9 @@ pub struct Photos {
     client: Client,
     months: Vec<Value>,
     all: Vec<Value>,
-    trash: bool,
+    /// The place shown: "all", "videos" or "trash" (Recently deleted).
+    view: String,
+    info: AppInfo,
     open: Option<Value>,
     adding: Option<(usize, usize)>,
     error: String,
@@ -86,12 +90,12 @@ pub struct Photos {
 
 pub struct Widgets {
     title: gtk::Label,
-    count: gtk::Label,
     column: gtk::Box,
-    back: gtk::Button,
-    trash: gtk::Button,
     add: gtk::Button,
-    lead: gtk::Label,
+    /// The sidebar's places and the rail's (redrawn with their counts).
+    side_rows: gtk::Box,
+    rail_rows: gtk::Box,
+    close_peek: std::rc::Rc<dyn Fn()>,
     error: gtk::Label,
     groups: gtk::Box,
     progress: gtk::Label,
@@ -136,9 +140,13 @@ fn square_of(thumb: &str, size: i32) -> Option<gdk::Texture> {
 }
 
 impl Photos {
-    /// What the grid shows: the photos, or the deleted ones, by month.
+    /// What the grid shows: the photos, the videos or the deleted ones, by month.
     fn gallery(&self) -> Value {
-        core::gallery_of(&self.all, self.trash)
+        core::view_of(&self.all, &self.view)
+    }
+
+    fn trash(&self) -> bool {
+        self.view == "trash"
     }
 
     fn shown(&self) -> Vec<Value> {
@@ -147,8 +155,10 @@ impl Photos {
     }
 
     /// Phones (under 720 points): three columns, 3 apart, as Photos.svelte's media query.
+    /// `width`: the grid's own (beside the sidebar or the rail). Under 560:
+    /// three columns that fill it, as on phones.
     fn narrow(&self) -> bool {
-        self.width > 0 && self.width < 720
+        self.width > 0 && self.width < 560
     }
 
     fn cell_size(&self) -> i32 {
@@ -157,16 +167,44 @@ impl Photos {
 
     fn render(&self, w: &Widgets, sender: &ComponentSender<Self>) {
         let g = self.gallery();
-        if self.narrow() { w.column.add_css_class("narrow") } else { w.column.remove_css_class("narrow") }
-        let photos = g["photos"].as_u64().unwrap_or(0);
-        let trash = g["trash"].as_u64().unwrap_or(0);
-        w.title.set_label(if self.trash { "Recently Deleted" } else { "Photos" });
-        w.count.set_label(&if self.trash || photos == 0 { String::new() } else { photos.to_string() });
-        w.back.set_visible(self.trash);
-        w.trash.set_visible(!self.trash && trash > 0);
-        w.add.set_visible(!self.trash);
+        if self.narrow() {
+            w.column.add_css_class("narrow");
+            w.title.add_css_class("compact");
+        } else {
+            w.column.remove_css_class("narrow");
+            w.title.remove_css_class("compact");
+        }
+        let places = [("all", "Photos", "photo", g["photos"].as_u64().unwrap_or(0)), ("videos", "Videos", "play", g["videos"].as_u64().unwrap_or(0)), ("trash", "Recently deleted", "trash", g["trash"].as_u64().unwrap_or(0))];
+        let (name, count) = places.iter().find(|p| p.0 == self.view).map(|p| (p.1, p.3)).unwrap_or(("Photos", 0));
+        // The name, its count in grey after it (as Calendar's month and year).
+        let grey = if count == 0 { String::new() } else { count.to_string() };
+        w.title.set_markup(&format!("<b>{name}</b> <span weight=\"normal\" alpha=\"55%\">{grey}</span>"));
+        w.add.set_visible(!self.trash());
         w.add.set_sensitive(self.adding.is_none());
-        w.lead.set_visible(self.trash);
+        for b in [&w.side_rows, &w.rail_rows] {
+            while let Some(c) = b.first_child() {
+                b.remove(&c);
+            }
+        }
+        for (id, label, icon, n) in places {
+            // Recently deleted only while something is there.
+            if id == "trash" && n == 0 && !self.trash() {
+                continue;
+            }
+            let on = id == self.view;
+            let count = gtk::Label::new(Some(&if n == 0 { String::new() } else { n.to_string() }));
+            let row = uuob_kit_gtk::sidebar_row(Some(uuob_kit_gtk::icon(icon, 19, 1.75, "text2").upcast_ref()), label, Some(count.upcast_ref()), on);
+            let rail = uuob_kit_gtk::rail_icon(icon, label, on);
+            for b in [&row, &rail] {
+                let (tx, id, close) = (sender.clone(), id.to_string(), w.close_peek.clone());
+                b.connect_clicked(move |_| {
+                    close();
+                    tx.input(Msg::Show(id.clone()));
+                });
+            }
+            w.side_rows.append(&row);
+            w.rail_rows.append(&rail);
+        }
         w.error.set_label(&self.error);
         w.error.set_visible(!self.error.is_empty());
         w.progress.set_visible(self.adding.is_some());
@@ -192,28 +230,21 @@ impl Photos {
         w.pages.set_visible_child_name(if self.open.is_some() { "viewer" } else { "grid" });
     }
 
+    /// An empty place: what is (not) there in a few words, Add photos where it helps.
     fn intro(&self, sender: &ComponentSender<Self>) -> gtk::Widget {
-        // `.card.intro`: an orange photo glyph on a white card.
-        let page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).css_classes(["card-web", "intro"]).build();
-        let glyph = gtk::Box::builder().halign(gtk::Align::Center).css_classes(["glyph"]).build();
-        let gi = uuob_kit_gtk::icon("photo", 30, 1.75, "orange");
-        gi.set_hexpand(true);
-        gi.set_halign(gtk::Align::Center);
-        glyph.append(&gi);
-        glyph.set_hexpand(false);
-        page.append(&glyph);
-        if self.trash {
-            page.append(&gtk::Label::builder().label("Nothing here").css_classes(["headline"]).build());
-        } else {
-            page.append(&gtk::Label::builder().label("No photos yet").css_classes(["headline"]).build());
-            let add = uuob_kit_gtk::btn("Add photos", Some("plus"), &["primary", "lg"]);
-            add.set_halign(gtk::Align::Center);
+        let (icon, headline) = match self.view.as_str() {
+            "trash" => ("trash", "Nothing here"),
+            "videos" => ("play", "No videos"),
+            _ => ("photo", "No photos yet"),
+        };
+        let add = (self.view == "all").then(|| {
+            let add = uuob_kit_gtk::btn("Add photos", Some("plus"), &["primary"]);
             add.set_sensitive(self.adding.is_none());
             let sender = sender.clone();
             add.connect_clicked(move |_| sender.input(Msg::Pick));
-            page.append(&add);
-        }
-        page.upcast()
+            add
+        });
+        uuob_kit_gtk::empty_state(icon, headline, "orange", add.as_ref()).upcast()
     }
 
     fn cell(&self, p: &Value, sender: &ComponentSender<Self>) -> gtk::Widget {
@@ -223,7 +254,7 @@ impl Photos {
             Some(t) => overlay.set_child(Some(&gtk::Picture::builder().paintable(&t).content_fit(gtk::ContentFit::Cover).can_shrink(true).build())),
             None => overlay.set_child(Some(&uuob_kit_gtk::icon(if is_video(p) { "play" } else { "photo" }, 28, 1.75, "text3"))),
         }
-        let badge = if self.trash {
+        let badge = if self.trash() {
             let d = core::days_left(p["deleted"].as_i64().unwrap_or(0), now());
             Some(format!("{d} {}", if d == 1 { "day" } else { "days" }))
         } else if is_video(p) {
@@ -233,7 +264,7 @@ impl Photos {
         };
         if let Some(b) = badge {
             let pill = gtk::Box::builder().spacing(4).halign(gtk::Align::End).valign(gtk::Align::End).css_classes(["badge"]).build();
-            if !self.trash {
+            if !self.trash() {
                 pill.append(&uuob_kit_gtk::icon("play", 11, 2.4, "#ffffff"));
             }
             if !b.trim().is_empty() {
@@ -247,7 +278,7 @@ impl Photos {
         let menu = gtk::Popover::builder().has_arrow(false).css_classes(["web-menu-pop"]).build();
         menu.set_parent(&button);
         let items = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
-        let choices: Vec<(&str, Msg)> = if self.trash {
+        let choices: Vec<(&str, Msg)> = if self.trash() {
             vec![("Open", Msg::Open(Some(p.clone()))), ("Restore", Msg::Restore(p.clone())), ("Delete forever…", Msg::Confirm(p.clone()))]
         } else {
             let mut c = vec![("Open", Msg::Open(Some(p.clone()))), ("Save…", Msg::Save(Some(p.clone())))];
@@ -424,8 +455,7 @@ fn style() {
          .grid-page.narrow .large-title { font-size: 30px; }
          .grid-page.narrow .cell, .grid-page.narrow .cell-button { border-radius: 3px; }
          .photos-head { margin-bottom: 18px; }
-         .count { font-size: 22px; font-weight: 600; color: @uuob_text3; margin-left: 4px; }
-         .lead { margin: -6px 0 18px; }
+         .side-col { padding: 4px 12px 12px; }
          .month { margin: 26px 0 10px; }
          .month:first-child { margin-top: 6px; }
          .intro { padding: 44px 24px; margin-top: 24px; }
@@ -470,48 +500,47 @@ impl relm4::Component for Photos {
             version: core::version(),
         };
 
-        // The grid.
-        // As on the web: a large title with the count, then the trash and Add.
-        let header = adw::HeaderBar::builder().show_title(false).build();
-        header.pack_start(&uuob_kit_gtk::update_button(FEED, info.version.clone()));
-        let title = gtk::Label::builder().label("Photos").xalign(0.0).css_classes(["large-title"]).build();
-        let count = gtk::Label::builder().valign(gtk::Align::Center).hexpand(true).xalign(0.0).css_classes(["count"]).build();
-        let back = uuob_kit_gtk::icon_btn("left", 22, "Back to photos");
-        back.set_visible(false);
-        let trash = uuob_kit_gtk::icon_btn("trash", 20, "Recently deleted");
-        trash.set_visible(false);
-        let add = uuob_kit_gtk::btn("Add", Some("plus"), &["primary"]);
-        add.set_valign(gtk::Align::Center);
-        let top = gtk::Box::builder().spacing(10).css_classes(["photos-head"]).build();
-        top.append(&back);
-        top.append(&title);
-        top.append(&count);
-        top.append(&trash);
-        top.append(&add);
-        back.connect_clicked({
+        // The sidebar (the kit's): Photos, Videos, Recently deleted; Settings.
+        let side_rows = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+        let settings = uuob_kit_gtk::sidebar_row(Some(uuob_kit_gtk::icon("settings", 19, 1.75, "text2").upcast_ref()), "Settings", None, false);
+        settings.set_valign(gtk::Align::End);
+        settings.set_vexpand(true);
+        settings.connect_clicked({
             let s = sender.clone();
-            move |_| s.input(Msg::Trash(false))
+            move |_| s.input(Msg::Settings)
         });
-        trash.connect_clicked({
+        let side = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).vexpand(true).css_classes(["side-col"]).build();
+        side.append(&side_rows);
+        side.append(&settings);
+        let side_view = adw::ToolbarView::new();
+        let sh = adw::HeaderBar::builder().show_title(false).show_end_title_buttons(false).build();
+        sh.pack_start(&uuob_kit_gtk::update_button(FEED, info.version.clone()));
+        side_view.add_top_bar(&sh);
+        side_view.set_content(Some(&gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).child(&side).build()));
+        let rail = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).margin_top(12).vexpand(true).build();
+        let rail_rows = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+        rail.append(&rail_rows);
+        let rail_settings = uuob_kit_gtk::rail_icon("settings", "Settings (Ctrl+,)", false);
+        rail_settings.set_vexpand(true);
+        rail_settings.set_valign(gtk::Align::End);
+        rail_settings.connect_clicked({
             let s = sender.clone();
-            move |_| s.input(Msg::Trash(true))
+            move |_| s.input(Msg::Settings)
         });
+        rail.append(&rail_settings);
+
+        // The grid: the toolbar (the place and its count, the +), then the months.
+        let header = adw::HeaderBar::builder().show_title(false).show_start_title_buttons(false).build();
+        let add = uuob_kit_gtk::plus_button("Add photos (Ctrl+N)");
+        let (top, title) = uuob_kit_gtk::toolbar("", false, &[], Some(&add));
         add.connect_clicked({
             let s = sender.clone();
             move |_| s.input(Msg::Pick)
         });
-        let lead = gtk::Label::builder()
-            .label("Photos stay here for 30 days after you delete them, then they are removed from all your devices.")
-            .wrap(true)
-            .xalign(0.0)
-            .css_classes(["secondary", "lead"])
-            .visible(false)
-            .build();
         let error = gtk::Label::builder().wrap(true).xalign(0.0).css_classes(["error"]).visible(false).build();
         let groups = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).css_classes(["grid-page"]).build();
         column.append(&top);
-        column.append(&lead);
         column.append(&error);
         column.append(&groups);
         let clamp = adw::Clamp::builder().maximum_size(1040).tightening_threshold(1040).child(&column).build();
@@ -603,8 +632,9 @@ impl relm4::Component for Photos {
         });
         picture.add_controller(swipe);
 
+        let scaffold = uuob_kit_gtk::SidebarScaffold::new("photos", &side_view, &rail, &grid);
         let pages = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).hhomogeneous(false).vhomogeneous(false).build();
-        pages.add_named(&grid, Some("grid"));
+        pages.add_named(&scaffold.widget(), Some("grid"));
         pages.add_named(&viewer_view, Some("viewer"));
 
         // Keys in the viewer: Escape, ←, →, Ctrl+S, Ctrl+C, Delete, I.
@@ -625,6 +655,7 @@ impl relm4::Component for Photos {
                     gdk::Key::c if ctrl => s.input(Msg::Copy(None)),
                     gdk::Key::Delete => s.input(Msg::Remove(Value::Null)),
                     gdk::Key::i => s.input(Msg::Info(None)),
+                    gdk::Key::space => s.input(Msg::Close),
                     _ => return glib::Propagation::Proceed,
                 }
                 glib::Propagation::Stop
@@ -632,7 +663,30 @@ impl relm4::Component for Photos {
         });
         root.add_controller(keys);
 
-        let gate = Gate::new(info, client.clone(), {
+        // The shared shortcuts (docs/design.md) and Photos' own: the places, Info.
+        {
+            let m = |msg: fn() -> Msg| -> std::rc::Rc<dyn Fn()> {
+                let s = sender.clone();
+                std::rc::Rc::new(move || s.input(msg()))
+            };
+            uuob_kit_gtk::Shortcuts {
+                settings: Some(m(|| Msg::Settings)),
+                new: Some(("Add photos".into(), m(|| Msg::Pick))),
+                find: None,
+                toggle_sidebar: Some(scaffold.toggler()),
+                refresh: Some(m(|| Msg::Reload)),
+                extra: vec![
+                    ("Photos".into(), "<Control>1".into(), m(|| Msg::Show("all".into()))),
+                    ("Videos".into(), "<Control>2".into(), m(|| Msg::Show("videos".into()))),
+                    ("Recently deleted".into(), "<Control>3".into(), m(|| Msg::Show("trash".into()))),
+                    ("Info".into(), "<Control>i".into(), m(|| Msg::Info(None))),
+                ],
+            }
+            .install(root.upcast_ref());
+        }
+        let close_peek = scaffold.closer();
+        std::mem::forget(scaffold);
+        let gate = Gate::new(info.clone(), client.clone(), {
             let s = sender.clone();
             move || s.input(Msg::Reload)
         });
@@ -654,16 +708,17 @@ impl relm4::Component for Photos {
         });
 
         let all = client.cached_all("photos");
-        let model = Photos { client, months: vec![], all, trash: false, open: None, adding: None, error: String::new(), made: HashMap::new(), purged: false, width: 1100 };
+        let model = Photos { client, months: vec![], all, view: "all".into(), info, open: None, adding: None, error: String::new(), made: HashMap::new(), purged: false, width: 1100 };
         let viewer = Viewer { when, stage, preview, picture, video, delete, restore, destroy, prev, next, save, copy };
-        let widgets = Widgets { title, count, column: column.clone(), back, trash, add, lead, error, groups, progress, pages, viewer, toasts };
+        let widgets = Widgets { title, column: column.clone(), add, side_rows, rail_rows, close_peek, error, groups, progress, pages, viewer, toasts };
         model.render(&widgets, &sender);
         // Narrow windows lay the grid out as the web version did on phones.
         root.add_tick_callback({
             let s = sender.clone();
             let last = std::cell::Cell::new(0);
-            move |r, _| {
-                let w = r.width();
+            let area = grid_overlay.clone();
+            move |_, _| {
+                let w = area.width();
                 if w > 0 && w != last.get() {
                     last.set(w);
                     s.input(Msg::Width(w));
@@ -697,7 +752,15 @@ impl relm4::Component for Photos {
                 });
                 return;
             }
-            Msg::Trash(on) => self.trash = on,
+            Msg::Show(view) => {
+                self.view = view;
+                self.open = None;
+            }
+            Msg::Settings => {
+                let dialog = uuob_kit_gtk::settings_dialog(&self.info, &self.client, false, vec![], || {});
+                dialog.present(Some(root));
+                return;
+            }
             Msg::Open(p) => {
                 self.open = p;
                 self.show(w, &sender);
@@ -855,20 +918,23 @@ impl relm4::Component for Photos {
             }
             Msg::Info(p) => {
                 let p = p.unwrap_or_else(current);
+                if p.is_null() {
+                    return;
+                }
                 let rows: Vec<Value> = serde_json::from_str(&core::details(p.to_string())).unwrap_or_default();
-                let col = gtk::Box::builder().orientation(gtk::Orientation::Vertical).margin_start(20).margin_end(20).margin_bottom(16).build();
+                // The kit's detail card: Info and ✕, then a row for each detail.
+                let (d, body) = uuob_kit_gtk::detail_sheet("Info", &[]);
+                let col = gtk::Box::builder().orientation(gtk::Orientation::Vertical).margin_top(6).css_classes(["icon-rows"]).build();
                 for (i, r) in rows.iter().enumerate() {
-                    let value = gtk::Label::builder().label(s(r, "value")).selectable(true).ellipsize(gtk::pango::EllipsizeMode::Middle).xalign(1.0).build();
+                    let value = gtk::Label::builder().label(s(r, "value")).selectable(true).focusable(false).ellipsize(gtk::pango::EllipsizeMode::Middle).xalign(1.0).css_classes(["dim-label"]).build();
                     let row = uuob_kit_gtk::icon_setting_row(Some(s(r, "icon")), s(r, "label"), &value);
                     if i + 1 == rows.len() {
                         row.add_css_class("last");
                     }
                     col.append(&row);
                 }
-                let view = adw::ToolbarView::new();
-                view.add_top_bar(&adw::HeaderBar::new());
-                view.set_content(Some(&col));
-                adw::Dialog::builder().title("Info").content_width(380).child(&view).build().present(Some(root));
+                body.append(&col);
+                d.present(Some(root));
                 return;
             }
             Msg::Destroy(p) => {

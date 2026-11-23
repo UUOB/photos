@@ -23,17 +23,25 @@ struct PhotosApp: App {
     var body: some Scene {
         WindowGroup("Photos") {
             Gate(uuob: model.uuob, updater: updater) { PhotosView(model: model, updater: updater) }
-                .frame(minWidth: 360, minHeight: 420)
+                .frame(minWidth: 380, minHeight: 420)
                 .background(Look.bg)
         }
-        // No title bar: the page is the window, as on the web.
+        // No title bar: the sidebar and the grid are the window, as on the web.
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1100, height: 760)
-        .commands {
-            CommandGroup(replacing: .newItem) {
-                Button("Add Photos…") { model.pick() }.keyboardShortcut("o")
-            }
-        }
+        .commands { Self.commands(model) }
+    }
+
+    /// The shared shortcuts (docs/design.md) and Photos' own: the places.
+    @MainActor static func commands(_ model: PhotosModel) -> UuobCommands {
+        let places = [("Photos", "all"), ("Videos", "videos"), ("Recently Deleted", "trash")]
+        return UuobCommands(
+            settings: { model.settingsOpen = true },
+            new: { model.pick() }, newTitle: "Add Photos",
+            refresh: { Task { await model.load() } },
+            extraMenu: "Go",
+            extra: places.enumerated().map { i, v in Shortcut(title: v.0, key: KeyEquivalent(Character("\(i + 1)"))) { model.show(v.1) } }
+        )
     }
 }
 
@@ -44,9 +52,15 @@ func now() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 @MainActor
 final class PhotosModel {
     let uuob: Uuob
+    let settings: UuobSettings
     var months: [J] = []
     var all = "[]"
-    var trash = false
+    /// The place shown: "all", "videos" or "trash" (Recently deleted).
+    var view = "all"
+    var trash: Bool { view == "trash" }
+    var settingsOpen = false
+    /// The photo whose details are shown (⌘I).
+    var info: J?
     var open: J?
     var confirm: J?
     var adding: (Int, Int)?
@@ -57,6 +71,7 @@ final class PhotosModel {
 
     init(_ uuob: Uuob) {
         self.uuob = uuob
+        settings = UuobSettings(uuob)
         all = uuob.client.cachedAll(collection: "photos")
         Task {
             for await e in uuob.events() where e.type.string == "changed" || e.state.string == "connected" {
@@ -66,7 +81,12 @@ final class PhotosModel {
     }
 
     var client: UuobClient { uuob.client }
-    var grid: J { J(text: gallery(recordsJson: all, trash: trash)) }
+    var grid: J { J(text: galleryView(recordsJson: all, view: view)) }
+
+    func show(_ place: String) {
+        view = place
+        open = nil
+    }
     var shown: [J] { grid.groups.array.flatMap { $0.items.array } }
 
     func load() async {
@@ -248,27 +268,15 @@ struct PhotosView: View {
     var body: some View {
         let g = model.grid
         ZStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    header(g)
-                    if model.trash {
-                        Text("Photos stay here for 30 days after you delete them, then they are removed from all your devices.")
-                            .font(.system(size: 17)).foregroundStyle(Look.text2).padding(.top, -6).padding(.bottom, 18)
-                    }
-                    if !model.error.isEmpty { Text(model.error).foregroundStyle(Look.danger).padding(.bottom, 14) }
-                    if g.groups.array.isEmpty { intro }
-                    ForEach(Array(g.groups.array.enumerated()), id: \.element.monthId) { n, group in
-                        SectionLabel(group.label.string).padding(.top, n == 0 ? 6 : 26).padding(.bottom, 10)
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 4)], spacing: 4) {
-                            ForEach(group.items.array, id: \.text) { p in cell(p) }
-                        }
-                    }
-                }
-                .frame(maxWidth: 1040)
-                .padding(.horizontal, 32).padding(.top, 48).padding(.bottom, 48)
-                .frame(maxWidth: .infinity)
+            // The places on the left (a rail of icons when folded or narrow), the grid on the right.
+            SidebarScaffold {
+                PhotosSidebar(model: model, updater: updater, places: places(g))
+            } rail: {
+                PhotosRail(model: model, places: places(g))
+            } content: {
+                gridView(g)
             }
-            .background(Look.bg)
+            .uuobKeys(PhotosApp.commands(model))
             if let (done, total) = model.adding {
                 VStack {
                     Spacer()
@@ -297,6 +305,8 @@ struct PhotosView: View {
         .foregroundStyle(Look.text)
         .animation(.easeOut(duration: 0.18), value: model.open?.text)
         .task { await model.load() }
+        .sheet(isPresented: $model.settingsOpen) { SettingsSheet(app: photosApp, settings: model.settings) { EmptyView() } }
+        .sheet(item: $model.info) { p in InfoSheet(p: p) { model.info = nil } }
         .sheet(item: $model.confirm) { p in
             ChoiceSheet(
                 title: "Delete this \(p.type.string.hasPrefix("video/") ? "video" : "photo")?",
@@ -310,43 +320,45 @@ struct PhotosView: View {
         }
     }
 
-    /// The large title with the count, then the trash and Add (or Back in Recently Deleted).
-    private func header(_ g: J) -> some View {
-        HStack(spacing: 10) {
-            if model.trash {
-                IconButton("back", size: 22, help: "Back to photos") { model.trash = false }
-                LargeTitle("Recently Deleted")
-            } else {
-                LargeTitle("Photos")
-                if g.photos.int > 0 { Text("\(g.photos.int)").font(.system(size: 22, weight: .semibold)).foregroundStyle(Look.text3).padding(.leading, 4) }
-            }
-            Spacer()
-            UpdateButton(updater: updater)
-            if !model.trash {
-                if g.trash.int > 0 { IconButton("trash", size: 20, help: "Recently deleted") { model.trash = true } }
-                Button { model.pick() } label: { IconLabel("plus", "Add") }.buttonStyle(UuobButton(.primary)).disabled(model.adding != nil).fixedSize()
-            }
-        }
-        .padding(.bottom, 18)
+    /// The sidebar's places: (id, name, icon, count); Recently deleted only while something is there.
+    private func places(_ g: J) -> [(String, String, String, Int)] {
+        [("all", "Photos", "photo", g.photos.int), ("videos", "Videos", "play", g.videos.int), ("trash", "Recently deleted", "trash", g.trash.int)]
+            .filter { $0.0 != "trash" || $0.3 > 0 || model.trash }
     }
 
-    /// `.card.intro`.
-    private var intro: some View {
-        VStack(spacing: 4) {
-            Ico("photo", size: 30).foregroundStyle(Palette.color("orange"))
-                .frame(width: 60, height: 60).background(Look.surface2, in: RoundedRectangle(cornerRadius: 18, style: .continuous)).padding(.bottom, 8)
-            if model.trash {
-                Text("Nothing here").font(.system(size: 17, weight: .semibold))
-            } else {
-                Text("No photos yet").font(.system(size: 17, weight: .semibold))
-                Spacer().frame(height: 18)
-                Button { model.pick() } label: { IconLabel("plus", "Add photos") }.buttonStyle(UuobButton(.primary, large: true)).disabled(model.adding != nil)
+    /// The grid: the toolbar (the place and its count, the +), then the months.
+    private func gridView(_ g: J) -> some View {
+        let here = places(g).first { $0.0 == model.view } ?? ("all", "Photos", "photo", g.photos.int)
+        return GeometryReader { geo in
+            let compact = geo.size.width < 640
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    Toolbar(title: titleText(here.1, here.3 > 0 ? "\(here.3)" : ""), compact: compact,
+                            add: model.trash || model.adding != nil ? nil : { model.pick() }, addHelp: "Add photos (⌘N)") {
+                        UpdateButton(updater: updater)
+                    }
+                    if !model.error.isEmpty { Text(model.error).foregroundStyle(Look.danger).padding(.bottom, 14) }
+                    if g.groups.array.isEmpty {
+                        switch model.view {
+                        case "trash": EmptyState(icon: "trash", headline: "Nothing here")
+                        case "videos": EmptyState(icon: "play", headline: "No videos")
+                        default: EmptyState(icon: "photo", headline: "No photos yet", color: Palette.color("orange"), action: model.adding == nil ? ("Add photos", { model.pick() } as () -> Void) : nil)
+                        }
+                    }
+                    ForEach(Array(g.groups.array.enumerated()), id: \.element.monthId) { n, group in
+                        SectionLabel(group.label.string).padding(.top, n == 0 ? 6 : 26).padding(.bottom, 10)
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 4)], spacing: 4) {
+                            ForEach(group.items.array, id: \.text) { p in cell(p) }
+                        }
+                    }
+                }
+                .frame(maxWidth: 1040)
+                .padding(.horizontal, compact ? 14 : 28).padding(.top, compact ? 40 : 48).padding(.bottom, 48)
+                .frame(maxWidth: .infinity)
             }
+            .scrollIndicators(.never)
+            .background(Look.bg)
         }
-        .padding(.vertical, 44).padding(.horizontal, 24).frame(maxWidth: .infinity)
-        .background(Look.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Look.line))
-        .padding(.top, 24)
     }
 
     private func cell(_ p: J) -> some View {
@@ -404,7 +416,6 @@ struct Viewer: View {
     @State private var image: NSImage?
     @State private var player: AVPlayer?
     @State private var missing = false
-    @State private var info = false
 
     var body: some View {
         let video = p.type.string.hasPrefix("video/")
@@ -414,8 +425,9 @@ struct Viewer: View {
                 Button { model.open = nil } label: { Ico("close", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut(.cancelAction).help("Close")
                 Text(whenLabel(ms: p.taken.int64)).font(.system(size: 15)).foregroundStyle(.white.opacity(0.8)).lineLimit(1).truncationMode(.tail)
                 Spacer()
-                Button { info.toggle() } label: { Ico("info", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("i").help("Info (⌘I)")
-                    .popover(isPresented: $info, arrowEdge: .bottom) { InfoPanel(p: p) }
+                Button { model.info = p } label: { Ico("info", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("i").help("Info (⌘I)")
+                // Space closes, as Quick Look does.
+                Button("") { model.open = nil }.keyboardShortcut(.space, modifiers: []).opacity(0).frame(width: 0, height: 0)
                 if !p.deleted.isNull {
                     Button("Restore") { model.open = nil; Task { await model.restore(p) } }.buttonStyle(UuobButton())
                     Button("Delete") { model.confirm = p }.buttonStyle(UuobButton(.danger))
@@ -500,23 +512,66 @@ struct Viewer: View {
     }
 }
 
-/// A photo's details, in the event card's style: an icon and a line each.
-struct InfoPanel: View {
+/// A photo's details (the kit's detail card): an icon and a line each.
+struct InfoSheet: View {
     let p: J
+    var onClose: () -> Void
     var body: some View {
         let rows = J(text: details(record: p.text)).array
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(rows.enumerated()), id: \.offset) { i, r in
-                IconRow(r.icon.string, last: i == rows.count - 1) {
-                    Text(r.label.string).foregroundStyle(Look.text2)
-                    Spacer(minLength: 16)
-                    Text(r["value"].string).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+        DetailSheet(title: "Info", onClose: onClose) {
+            EmptyView()
+        } content: {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { i, r in
+                    IconRow(r.icon.string, last: i == rows.count - 1) {
+                        Text(r.label.string)
+                        Spacer(minLength: 16)
+                        Text(r["value"].string).foregroundStyle(Look.text2).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                    }
                 }
             }
+            .padding(.top, 6)
         }
-        .padding(.horizontal, 18).padding(.vertical, 8)
-        .frame(width: 340)
-        .foregroundStyle(Look.text)
+    }
+}
+
+/// The sidebar (the kit's): Photos, Videos, Recently deleted; Settings.
+struct PhotosSidebar: View {
+    @Bindable var model: PhotosModel
+    @Bindable var updater: Updater
+    let places: [(String, String, String, Int)]
+    @Environment(\.uuobClosePeek) private var closePeek
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Color.clear.frame(height: 36) // the window's buttons
+            ForEach(places, id: \.0) { p in
+                SidebarRow(title: p.1, selected: model.view == p.0) {
+                    Ico(p.2, size: 19).foregroundStyle(Look.text2)
+                } trailing: {
+                    Text(p.3 > 0 ? "\(p.3)" : "")
+                } action: { model.show(p.0); closePeek() }
+            }
+            Spacer()
+            SidebarRow(title: "Settings") { Ico("settings", size: 19).foregroundStyle(Look.text2) } action: { closePeek(); model.settingsOpen = true }
+        }
+        .padding(.horizontal, 12).padding(.top, 20).padding(.bottom, 4)
+    }
+}
+
+/// Folded or narrow: the places' icons, Settings.
+struct PhotosRail: View {
+    @Bindable var model: PhotosModel
+    let places: [(String, String, String, Int)]
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Color.clear.frame(height: 30) // the window's buttons
+            ForEach(places, id: \.0) { p in RailButton(p.2, help: p.1, selected: model.view == p.0) { model.show(p.0) } }
+            Spacer()
+            RailButton("settings", help: "Settings (⌘,)") { model.settingsOpen = true }
+        }
+        .padding(.top, 4)
     }
 }
 

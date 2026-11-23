@@ -1,5 +1,19 @@
 package app.uuob.photos
 
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
+import app.uuob.kit.DetailSheet
+import app.uuob.kit.EmptyState
+import app.uuob.kit.RailIcon
+import app.uuob.kit.SettingsSheet
+import app.uuob.kit.Shortcuts
+import app.uuob.kit.ShortcutsHost
+import app.uuob.kit.SidebarRow
+import app.uuob.kit.SidebarScaffold
+import app.uuob.kit.Toolbar
+import androidx.compose.foundation.layout.height
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -122,7 +136,7 @@ import app.uuob.photos.core.details
 import app.uuob.photos.core.saveName
 import app.uuob.photos.core.durationLabel
 import app.uuob.photos.core.expired
-import app.uuob.photos.core.gallery
+import app.uuob.photos.core.galleryView
 import app.uuob.photos.core.jpegDataUrl
 import app.uuob.photos.core.markDeleted
 import app.uuob.photos.core.monthContainerKey
@@ -376,7 +390,11 @@ fun isVideo(p: JSONObject) = p.optString("type").startsWith("video/")
 @Composable
 fun PhotosScreen(model: PhotosModel, updater: Updater) {
   val scope = rememberCoroutineScope()
-  var trashView by remember { mutableStateOf(false) }
+  // The place shown: "all", "videos" or "trash" (Recently deleted); the phone's drawer; Settings.
+  var view by remember { mutableStateOf("all") }
+  var drawerOpen by remember { mutableStateOf(false) }
+  var settingsOpen by remember { mutableStateOf(false) }
+  val trashView = view == "trash"
   var open by remember { mutableStateOf<JSONObject?>(null) }
   var confirm by remember { mutableStateOf<JSONObject?>(null) }
   // Long-press a photo to choose several: then Download or Delete them together.
@@ -401,17 +419,42 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
     model.load()
     Uuob.events.collect { e -> if (e.optString("type") == "changed" || (e.optString("type") == "state" && e.optString("state") == "connected")) model.load() }
   }
-  val g = remember(model.all, trashView) { JSONObject(gallery(model.all, trashView)) }
+  val g = remember(model.all, view) { JSONObject(galleryView(model.all, view)) }
   val photoCount = g.optInt("photos")
   val trashCount = g.optInt("trash")
+  // The sidebar's places: (id, name, icon, count); Recently deleted only while something is there.
+  val places = listOf(Triple("all", "Photos", "photo") to photoCount, Triple("videos", "Videos", "play") to g.optInt("videos"), Triple("trash", "Recently deleted", "trash") to trashCount)
+    .filter { (p, n) -> p.first != "trash" || n > 0 || trashView }
+  fun go(id: String) { view = id; chosen = emptySet(); drawerOpen = false }
   val groups = objects(g.optJSONArray("groups")?.toString())
   val shown = groups.flatMap { objects(it.optJSONArray("items")?.toString()) }
-  BackHandler(enabled = trashView && open == null && chosen.isEmpty()) { trashView = false }
+  BackHandler(enabled = view != "all" && open == null && chosen.isEmpty()) { view = "all" }
   BackHandler(enabled = chosen.isNotEmpty() && open == null) { chosen = emptySet() }
   val picked = shown.filter { keyOf(it) in chosen }
 
+  val shortcuts = Shortcuts(
+    settings = { settingsOpen = true },
+    new = "Add photos" to { pick() },
+    refresh = { scope.launch { model.load() } },
+    extra = places.mapIndexed { i, (p, _) -> Shortcuts.Extra(p.second, "Ctrl+${i + 1}", listOf(Key.One, Key.Two, Key.Three)[i], true) { go(p.first) } },
+  )
+  ShortcutsHost(shortcuts) {
+  SidebarScaffold(drawerOpen, { drawerOpen = it }, sidebar = {
+    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+      Text("Photos", Modifier.padding(start = 10.dp, bottom = 6.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
+      places.forEach { (p, n) ->
+        SidebarRow(p.second, view == p.first, { go(p.first) }, leading = { Icon24(p.third, size = 19.dp, tint = Tokens.text2) }) { if (n > 0) Text("$n", fontSize = 14.sp) }
+      }
+    }
+    SidebarRow("Settings", onClick = { drawerOpen = false; settingsOpen = true }, leading = { Icon24("settings", size = 19.dp, tint = Tokens.text2) })
+  }, rail = {
+    Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+      places.forEach { (p, _) -> RailIcon(p.third, p.second, view == p.first) { go(p.first) } }
+    }
+    RailIcon("settings", "Settings") { settingsOpen = true }
+  }) {
   BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-    val phone = maxWidth < 720.dp
+    val phone = maxWidth < 600.dp
     LazyVerticalGrid(
       columns = if (phone) GridCells.Fixed(3) else GridCells.Adaptive(150.dp),
       contentPadding = PaddingValues(horizontal = if (phone) 12.dp else 32.dp, vertical = if (phone) 24.dp else 48.dp),
@@ -431,23 +474,29 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
             } else {
               Btn("Restore", { val list = picked; chosen = emptySet(); scope.launch { list.forEach { model.restore(it) } } })
             }
-          } else if (trashView) {
-            IconBtn("back", { trashView = false })
-            Text("Recently Deleted", fontSize = if (phone) 30.sp else 34.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.8).sp, maxLines = 1)
           } else {
-            Text("Photos", fontSize = if (phone) 30.sp else 34.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.8).sp)
-            if (photoCount > 0) Text("$photoCount", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Tokens.text3, modifier = Modifier.padding(start = 4.dp))
-            Spacer(Modifier.weight(1f))
-            UpdateButton(updater)
-            if (trashCount > 0) IconBtn("trash", { trashView = true }, size = 20.dp)
-            Btn("Add", ::pick, kind = BtnKind.Primary, icon = "plus", enabled = model.adding == null)
+            // The toolbar: the place and its count in grey, the update, the +.
+            val here = places.firstOrNull { it.first.first == view } ?: places.first()
+            val title = buildAnnotatedString {
+              withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(here.first.second) }
+              if (here.second > 0) withStyle(SpanStyle(fontWeight = FontWeight.Normal, color = Tokens.text3)) { append(" ${here.second}") }
+            }
+            Box(Modifier.weight(1f)) {
+              Toolbar(title, compact = phone, menu = if (phone) ({ drawerOpen = true }) else null, add = if (!trashView && model.adding == null) ::pick else null) { UpdateButton(updater) }
+            }
           }
         }
       }
       if (model.error.isNotEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
         Text(model.error, Modifier.padding(bottom = 14.dp), color = MaterialTheme.colorScheme.error)
       }
-      if (groups.isEmpty()) item(span = { GridItemSpan(maxLineSpan) }) { Intro(trashView, model.adding == null, ::pick) }
+      if (groups.isEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
+        when (view) {
+          "trash" -> EmptyState("trash", "Nothing here")
+          "videos" -> EmptyState("play", "No videos")
+          else -> EmptyState("photo", "No photos yet", color = Colors.of("orange"), action = if (model.adding == null) "Add photos" to { pick() } else null)
+        }
+      }
       groups.forEachIndexed { gi, group ->
         item(span = { GridItemSpan(maxLineSpan) }, key = "m" + group.optString("month")) {
           SectionLabel(group.optString("label"), Modifier.padding(top = if (gi == 0) 6.dp else 26.dp, bottom = 10.dp))
@@ -476,6 +525,9 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
       )
     }
   }
+  }
+  }
+  if (settingsOpen) SettingsSheet(onClose = { settingsOpen = false }) {}
   open?.let { p ->
     Viewer(
       p, shown,
@@ -495,11 +547,8 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
   }
   // A photo's details, in the event card's style.
   info?.let { p ->
-    WebSheet({ info = null }, padding = 22.dp) {
-      Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("Info", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.4).sp, modifier = Modifier.weight(1f))
-        IconBtn("close", { info = null }, size = 19.dp)
-      }
+    DetailSheet("Info", { info = null }) {
+      Spacer(Modifier.height(6.dp))
       val rows = objects(details(p.toString()))
       rows.forEachIndexed { i, r ->
         IconRow(r.optString("icon"), last = i == rows.size - 1) {
@@ -518,26 +567,6 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
       Row(Modifier.fillMaxWidth().padding(top = 22.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Btn("Cancel", { confirm = null }, Modifier.weight(1f), lg = true)
         Btn("Delete", { confirm = null; open = null; scope.launch { model.destroy(p); model.load() } }, Modifier.weight(1f), kind = BtnKind.Danger, lg = true)
-      }
-    }
-  }
-}
-
-/** `.card.intro`: what Photos is, and Add photos. */
-@Composable
-private fun Intro(trash: Boolean, canAdd: Boolean, pick: () -> Unit) {
-  WebCard(Modifier.fillMaxWidth().padding(top = 24.dp)) {
-    Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 44.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-      Box(Modifier.size(60.dp).clip(RoundedCornerShape(18.dp)).background(Tokens.surface2), contentAlignment = Alignment.Center) {
-        Icon24("photo", size = 30.dp, tint = Colors.of("orange"))
-      }
-      Spacer(Modifier.size(12.dp))
-      if (trash) {
-        Text("Nothing here", fontWeight = FontWeight.SemiBold)
-      } else {
-        Text("No photos yet", fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.size(18.dp))
-        Btn("Add photos", pick, kind = BtnKind.Primary, lg = true, icon = "plus", enabled = canAdd)
       }
     }
   }
@@ -601,9 +630,12 @@ private fun Viewer(
       .onKeyEvent {
         if (it.type != KeyEventType.KeyDown) return@onKeyEvent false
         when (it.key) {
-          Key.Escape -> { onClose(); true }
+          Key.Escape, Key.Spacebar -> { onClose(); true }
           Key.DirectionRight -> { step(1); true }
           Key.DirectionLeft -> { step(-1); true }
+          Key.S -> if (it.isCtrlPressed && !p.has("deleted")) { onDownload(); true } else false
+          Key.I -> if (!p.has("deleted")) { onInfo(); true } else false
+          Key.Delete, Key.Backspace -> if (!p.has("deleted")) { onDelete(); true } else false
           else -> false
         }
       },
