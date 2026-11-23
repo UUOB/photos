@@ -549,7 +549,8 @@ struct PhotosSidebar: View {
                 SidebarRow(title: p.1, selected: model.view == p.0) {
                     Ico(p.2, size: 19).foregroundStyle(Look.text2)
                 } trailing: {
-                    Text(p.3 > 0 ? "\(p.3)" : "")
+                    // No count by Recently deleted: its name needs the room (the toolbar shows it).
+                    Text(p.3 > 0 && p.0 != "trash" ? "\(p.3)" : "")
                 } action: { model.show(p.0); closePeek() }
             }
             Spacer()

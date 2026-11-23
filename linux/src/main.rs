@@ -192,7 +192,8 @@ impl Photos {
                 continue;
             }
             let on = id == self.view;
-            let count = gtk::Label::new(Some(&if n == 0 { String::new() } else { n.to_string() }));
+            // No count by Recently deleted: its name needs the room (the toolbar shows it).
+            let count = gtk::Label::new(Some(&if n == 0 || id == "trash" { String::new() } else { n.to_string() }));
             let row = uuob_kit_gtk::sidebar_row(Some(uuob_kit_gtk::icon(icon, 19, 1.75, "text2").upcast_ref()), label, Some(count.upcast_ref()), on);
             let rail = uuob_kit_gtk::rail_icon(icon, label, on);
             for b in [&row, &rail] {

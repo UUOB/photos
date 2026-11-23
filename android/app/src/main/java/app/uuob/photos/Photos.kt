@@ -12,6 +12,7 @@ import app.uuob.kit.Shortcuts
 import app.uuob.kit.ShortcutsHost
 import app.uuob.kit.SidebarRow
 import app.uuob.kit.SidebarScaffold
+import app.uuob.kit.LocalDrawerMode
 import app.uuob.kit.Toolbar
 import androidx.compose.foundation.layout.height
 import android.content.Context
@@ -441,9 +442,8 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
   ShortcutsHost(shortcuts) {
   SidebarScaffold(drawerOpen, { drawerOpen = it }, sidebar = {
     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-      Text("Photos", Modifier.padding(start = 10.dp, bottom = 6.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
       places.forEach { (p, n) ->
-        SidebarRow(p.second, view == p.first, { go(p.first) }, leading = { Icon24(p.third, size = 19.dp, tint = Tokens.text2) }) { if (n > 0) Text("$n", fontSize = 14.sp) }
+        SidebarRow(p.second, view == p.first, { go(p.first) }, leading = { Icon24(p.third, size = 19.dp, tint = Tokens.text2) }) { if (n > 0 && p.first != "trash") Text("$n", fontSize = 14.sp) }
       }
     }
     SidebarRow("Settings", onClick = { drawerOpen = false; settingsOpen = true }, leading = { Icon24("settings", size = 19.dp, tint = Tokens.text2) })
@@ -454,16 +454,17 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
     RailIcon("settings", "Settings") { settingsOpen = true }
   }) {
   BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-    val phone = maxWidth < 600.dp
+    val phone = LocalDrawerMode.current
+    val compactTitle = maxWidth < 720.dp
     LazyVerticalGrid(
       columns = if (phone) GridCells.Fixed(3) else GridCells.Adaptive(150.dp),
-      contentPadding = PaddingValues(horizontal = if (phone) 12.dp else 32.dp, vertical = if (phone) 24.dp else 48.dp),
+      contentPadding = PaddingValues(start = if (phone) 14.dp else 28.dp, end = if (phone) 14.dp else 28.dp, top = if (phone) 12.dp else 26.dp, bottom = 48.dp),
       horizontalArrangement = Arrangement.spacedBy(if (phone) 3.dp else 4.dp),
       verticalArrangement = Arrangement.spacedBy(if (phone) 3.dp else 4.dp),
       modifier = Modifier.fillMaxSize().safeDrawingPadding().widthIn(max = 1104.dp).align(Alignment.TopCenter),
     ) {
       item(span = { GridItemSpan(maxLineSpan) }) {
-        Row(Modifier.padding(bottom = 18.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(Modifier.padding(bottom = if (chosen.isNotEmpty()) 18.dp else 0.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
           if (chosen.isNotEmpty()) {
             IconBtn("close", { chosen = emptySet() })
             Text("${chosen.size} selected", fontSize = if (phone) 26.sp else 30.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.6).sp, maxLines = 1, modifier = Modifier.weight(1f))
@@ -482,7 +483,7 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
               if (here.second > 0) withStyle(SpanStyle(fontWeight = FontWeight.Normal, color = Tokens.text3)) { append(" ${here.second}") }
             }
             Box(Modifier.weight(1f)) {
-              Toolbar(title, compact = phone, menu = if (phone) ({ drawerOpen = true }) else null, add = if (!trashView && model.adding == null) ::pick else null) { UpdateButton(updater) }
+              Toolbar(title, compact = compactTitle, menu = if (phone) ({ drawerOpen = true }) else null, add = if (!trashView && model.adding == null) ::pick else null, addDescription = "Add photos") { UpdateButton(updater) }
             }
           }
         }
