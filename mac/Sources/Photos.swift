@@ -52,6 +52,8 @@ func now() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 @MainActor
 final class PhotosModel {
     let uuob: Uuob
+    /// The viewer's Share button, for its menu to hang from (`ShareAnchor`).
+    @ObservationIgnored weak var shareAnchor: NSView?
     let settings: UuobSettings
     var months: [J] = []
     var all = "[]"
@@ -208,14 +210,22 @@ final class PhotosModel {
     }
 
     /// The Mac's share menu (AirDrop, Messages, Mail…) for the original.
-    func share(_ p: J) {
+    /// The share menu: under the viewer's Share button (`fromButton`), or where
+    /// the pointer is (a right-click's Share…).
+    func share(_ p: J, fromButton: Bool = false) {
+        let window = NSApp.keyWindow
+        let mouse = NSEvent.mouseLocation
         Task {
             guard let data = await original(p) else { return }
             let url = FileManager.default.temporaryDirectory.appendingPathComponent(saveName(record: p.text))
             try? data.write(to: url)
-            guard let view = NSApp.keyWindow?.contentView else { return }
-            let anchor = NSRect(x: view.bounds.maxX - 140, y: view.bounds.maxY - 60, width: 1, height: 1)
-            NSSharingServicePicker(items: [url]).show(relativeTo: anchor, of: view, preferredEdge: .minY)
+            let picker = NSSharingServicePicker(items: [url])
+            if fromButton, let a = shareAnchor, a.window != nil {
+                picker.show(relativeTo: a.bounds, of: a, preferredEdge: a.isFlipped ? .maxY : .minY)
+            } else if let w = window, let view = w.contentView {
+                let at = view.convert(w.convertPoint(fromScreen: mouse), from: nil)
+                picker.show(relativeTo: NSRect(x: at.x, y: at.y, width: 1, height: 1), of: view, preferredEdge: view.isFlipped ? .maxY : .minY)
+            }
         }
     }
 
@@ -275,6 +285,10 @@ struct PhotosView: View {
                 PhotosRail(model: model, places: places(g))
             } content: {
                 gridView(g)
+            } footer: {
+                SettingsFoot { model.settingsOpen = true }
+            } railFooter: {
+                RailButton("settings", help: "Settings (⌘,)") { model.settingsOpen = true }
             }
             .uuobKeys(PhotosApp.commands(model))
             if let (done, total) = model.adding {
@@ -381,7 +395,7 @@ struct PhotosView: View {
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
         .buttonStyle(.plain)
-        .help("\(video ? "Video" : "Photo") from \(whenLabel(ms: p.taken.int64))")
+        .uuobHint("\(video ? "Video" : "Photo") from \(whenLabel(ms: p.taken.int64))")
         // Right-click (or Control-click): what the viewer offers, without opening it.
         .contextMenu {
             Button("Open") { model.open = p }
@@ -422,24 +436,24 @@ struct Viewer: View {
         let i = model.shown.firstIndex(where: { $0.id == p.id && $0.container == p.container }) ?? 0
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Button { model.open = nil } label: { Ico("close", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut(.cancelAction).help("Close")
+                Button { model.open = nil } label: { Ico("close", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut(.cancelAction).uuobHint("Close")
                 Text(whenLabel(ms: p.taken.int64)).font(.system(size: 15)).foregroundStyle(.white.opacity(0.8)).lineLimit(1).truncationMode(.tail)
                 Spacer()
-                Button { model.info = p } label: { Ico("info", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("i").help("Info (⌘I)")
+                Button { model.info = p } label: { Ico("info", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("i").uuobHint("Info (⌘I)")
                 // Space closes, as Quick Look does.
                 Button("") { model.open = nil }.keyboardShortcut(.space, modifiers: []).opacity(0).frame(width: 0, height: 0)
                 if !p.deleted.isNull {
                     Button("Restore") { model.open = nil; Task { await model.restore(p) } }.buttonStyle(UuobButton())
                     Button("Delete") { model.confirm = p }.buttonStyle(UuobButton(.danger))
                 } else {
-                    Button { model.share(p) } label: { Ico("share", size: 20) }.buttonStyle(OnBlack()).help("Share")
-                    Button { model.copy(p) } label: { Ico("copy", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("c").help("Copy (⌘C)")
-                    Button { model.save(p) } label: { Ico("download", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("s").help("Save… (⌘S)")
+                    Button { model.share(p, fromButton: true) } label: { Ico("share", size: 20) }.buttonStyle(OnBlack()).background(ShareAnchor(model: model)).uuobHint("Share")
+                    Button { model.copy(p) } label: { Ico("copy", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("c").uuobHint("Copy (⌘C)")
+                    Button { model.save(p) } label: { Ico("download", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut("s").uuobHint("Save… (⌘S)")
                     Button {
                         let next = model.shown.indices.contains(i + 1) ? model.shown[i + 1] : nil
                         model.open = next
                         Task { await model.remove(p) }
-                    } label: { Ico("trash", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut(.delete, modifiers: []).help("Delete (⌫)")
+                    } label: { Ico("trash", size: 20) }.buttonStyle(OnBlack()).keyboardShortcut(.delete, modifiers: []).uuobHint("Delete (⌫)")
                 }
             }
             // Below the window's own buttons, which sit over the top left.
@@ -458,12 +472,32 @@ struct Viewer: View {
                     Image(nsImage: t).resizable().scaledToFit()
                 }
                 HStack {
-                    if i > 0 { Button { model.step(-1) } label: { Ico("left", size: 22) }.buttonStyle(Nav()).keyboardShortcut(.leftArrow, modifiers: []).help("Previous") }
+                    if i > 0 { Button { model.step(-1) } label: { Ico("left", size: 22) }.buttonStyle(Nav()).keyboardShortcut(.leftArrow, modifiers: []).uuobHint("Previous") }
                     Spacer()
-                    if i < model.shown.count - 1 { Button { model.step(1) } label: { Ico("right", size: 22) }.buttonStyle(Nav()).keyboardShortcut(.rightArrow, modifiers: []).help("Next") }
+                    if i < model.shown.count - 1 { Button { model.step(1) } label: { Ico("right", size: 22) }.buttonStyle(Nav()).keyboardShortcut(.rightArrow, modifiers: []).uuobHint("Next") }
                 }
                 .padding(.horizontal, 14)
             }
+            // Right-click (or Control-click): what the grid's menu offers.
+            .contentShape(Rectangle())
+            .contextMenu {
+                if p.deleted.isNull {
+                    Button("Save…") { model.save(p) }
+                    Button("Copy") { model.copy(p) }
+                    Button("Share…") { model.share(p) }
+                    Button("Info") { model.info = p }
+                    Divider()
+                    Button("Delete") {
+                        let next = model.shown.indices.contains(i + 1) ? model.shown[i + 1] : nil
+                        model.open = next
+                        Task { await model.remove(p) }
+                    }
+                } else {
+                    Button("Restore") { model.open = nil; Task { await model.restore(p) } }
+                    Button("Delete Forever…") { model.confirm = p }
+                }
+            }
+
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Color.black)
@@ -554,7 +588,6 @@ struct PhotosSidebar: View {
                 } action: { model.show(p.0); closePeek() }
             }
             Spacer()
-            SidebarRow(title: "Settings") { Ico("settings", size: 19).foregroundStyle(Look.text2) } action: { closePeek(); model.settingsOpen = true }
         }
         .padding(.horizontal, 12).padding(.top, 20).padding(.bottom, 4)
     }
@@ -570,7 +603,6 @@ struct PhotosRail: View {
             Color.clear.frame(height: 30) // the window's buttons
             ForEach(places, id: \.0) { p in RailButton(p.2, help: p.1, selected: model.view == p.0) { model.show(p.0) } }
             Spacer()
-            RailButton("settings", help: "Settings (⌘,)") { model.settingsOpen = true }
         }
         .padding(.top, 4)
     }
@@ -592,4 +624,26 @@ final class AVPlayerViewHost: AVPlayerView {}
 extension J {
     /// Ids for `ForEach`.
     var monthId: String { self["month"].string }
+}
+
+/// Settings on the toggle's line at the sidebar's foot; closes the sidebar
+/// shown over a narrow window first.
+struct SettingsFoot: View {
+    let open: () -> Void
+    @Environment(\.uuobClosePeek) private var closePeek
+    var body: some View {
+        SidebarRow(title: "Settings") { Ico("settings", size: 19).foregroundStyle(Look.text2) } action: { closePeek(); open() }
+            .uuobHint("Settings (⌘,)")
+    }
+}
+
+/// Behind the viewer's Share button: the view its menu hangs from.
+struct ShareAnchor: NSViewRepresentable {
+    let model: PhotosModel
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async { model.shareAnchor = v }
+        return v
+    }
+    func updateNSView(_ v: NSView, context: Context) {}
 }

@@ -503,16 +503,14 @@ impl relm4::Component for Photos {
 
         // The sidebar (the kit's): Photos, Videos, Recently deleted; Settings.
         let side_rows = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+        // Settings goes on the toggle's line at the sidebar's foot (the kit's footer).
         let settings = uuob_kit_gtk::sidebar_row(Some(uuob_kit_gtk::icon("settings", 19, 1.75, "text2").upcast_ref()), "Settings", None, false);
-        settings.set_valign(gtk::Align::End);
-        settings.set_vexpand(true);
         settings.connect_clicked({
             let s = sender.clone();
             move |_| s.input(Msg::Settings)
         });
         let side = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).vexpand(true).css_classes(["side-col"]).build();
         side.append(&side_rows);
-        side.append(&settings);
         let side_view = adw::ToolbarView::new();
         let sh = adw::HeaderBar::builder().show_title(false).show_end_title_buttons(false).build();
         sh.pack_start(&uuob_kit_gtk::update_button(FEED, info.version.clone()));
@@ -522,13 +520,10 @@ impl relm4::Component for Photos {
         let rail_rows = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
         rail.append(&rail_rows);
         let rail_settings = uuob_kit_gtk::rail_icon("settings", "Settings (Ctrl+,)", false);
-        rail_settings.set_vexpand(true);
-        rail_settings.set_valign(gtk::Align::End);
         rail_settings.connect_clicked({
             let s = sender.clone();
             move |_| s.input(Msg::Settings)
         });
-        rail.append(&rail_settings);
 
         // The grid: the toolbar (the place and its count, the +), then the months.
         let header = adw::HeaderBar::builder().show_title(false).show_start_title_buttons(false).build();
@@ -634,6 +629,8 @@ impl relm4::Component for Photos {
         picture.add_controller(swipe);
 
         let scaffold = uuob_kit_gtk::SidebarScaffold::new("photos", &side_view, &rail, &grid);
+        scaffold.set_footer(&settings);
+        scaffold.set_rail_footer(&rail_settings);
         let pages = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).hhomogeneous(false).vhomogeneous(false).build();
         pages.add_named(&scaffold.widget(), Some("grid"));
         pages.add_named(&viewer_view, Some("viewer"));
@@ -737,6 +734,42 @@ impl relm4::Component for Photos {
                     _ => Msg::Confirm(Value::Null),
                 })
             });
+        }
+        // Right-click on the photo shown: the grid's menu for it (what the bar shows).
+        {
+            let v = &widgets.viewer;
+            let menu = gtk::Popover::builder().has_arrow(false).css_classes(["web-menu-pop"]).build();
+            menu.set_parent(&v.stage);
+            let right = gtk::GestureClick::builder().button(3).build();
+            let (delete, copy, menu2, s) = (v.delete.clone(), v.copy.clone(), menu.clone(), sender.clone());
+            right.connect_pressed(move |_, _, x, y| {
+                let mut choices: Vec<(&str, Msg)> = vec![];
+                if delete.is_visible() {
+                    choices.push(("Save…", Msg::Save(None)));
+                    if copy.is_visible() {
+                        choices.push(("Copy", Msg::Copy(None)));
+                    }
+                    choices.push(("Info", Msg::Info(None)));
+                    choices.push(("Delete", Msg::Remove(Value::Null)));
+                } else {
+                    choices.push(("Restore", Msg::Restore(Value::Null)));
+                    choices.push(("Delete forever…", Msg::Confirm(Value::Null)));
+                }
+                let items = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+                for (label, msg) in choices {
+                    let b = gtk::Button::builder().child(&gtk::Label::builder().label(label).xalign(0.0).build()).css_classes(["web-menu-item"]).build();
+                    let (s, m) = (s.clone(), menu2.clone());
+                    b.connect_clicked(move |_| {
+                        m.popdown();
+                        s.input(msg.clone());
+                    });
+                    items.append(&b);
+                }
+                menu2.set_child(Some(&items));
+                menu2.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                menu2.popup();
+            });
+            v.stage.add_controller(right);
         }
         ComponentParts { model, widgets }
     }

@@ -1,5 +1,10 @@
 package app.uuob.photos
 
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.ui.unit.DpOffset
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -446,12 +451,13 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
         SidebarRow(p.second, view == p.first, { go(p.first) }, leading = { Icon24(p.third, size = 19.dp, tint = Tokens.text2) }) { if (n > 0 && p.first != "trash") Text("$n", fontSize = 14.sp) }
       }
     }
-    SidebarRow("Settings", onClick = { drawerOpen = false; settingsOpen = true }, leading = { Icon24("settings", size = 19.dp, tint = Tokens.text2) })
   }, rail = {
     Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
       places.forEach { (p, _) -> RailIcon(p.third, p.second, view == p.first) { go(p.first) } }
     }
     RailIcon("settings", "Settings") { settingsOpen = true }
+  }, footer = {
+    SidebarRow("Settings", onClick = { drawerOpen = false; settingsOpen = true }, leading = { Icon24("settings", size = 19.dp, tint = Tokens.text2) })
   }) {
   BoxWithConstraints(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
     val phone = LocalDrawerMode.current
@@ -466,7 +472,7 @@ fun PhotosScreen(model: PhotosModel, updater: Updater) {
       item(span = { GridItemSpan(maxLineSpan) }) {
         Row(Modifier.padding(bottom = if (chosen.isNotEmpty()) 18.dp else 0.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
           if (chosen.isNotEmpty()) {
-            IconBtn("close", { chosen = emptySet() })
+            IconBtn("close", { chosen = emptySet() }, description = "Clear selection")
             Text("${chosen.size} selected", fontSize = if (phone) 26.sp else 30.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.6).sp, maxLines = 1, modifier = Modifier.weight(1f))
             if (!trashView) {
               IconBtn("share", { share(picked); chosen = emptySet() }, size = 20.dp, description = "Share")
@@ -644,7 +650,7 @@ private fun Viewer(
     val phone = maxWidth < 720.dp
     Column(Modifier.fillMaxSize()) {
       Row(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        IconBtn("close", onClose, tint = Color.White)
+        IconBtn("close", onClose, tint = Color.White, description = "Close")
         Text(whenLabel(p.optLong("taken")), color = Color.White.copy(alpha = 0.8f), fontSize = 15.sp, modifier = Modifier.weight(1f))
         if (p.has("deleted")) {
           Btn("Restore", onRestore)
@@ -653,14 +659,28 @@ private fun Viewer(
           IconBtn("info", onInfo, size = 20.dp, tint = Color.White, description = "Info")
           IconBtn("share", onShare, size = 20.dp, tint = Color.White, description = "Share")
           IconBtn("download", onDownload, size = 20.dp, tint = Color.White, description = "Download")
-          IconBtn("trash", onDelete, size = 20.dp, tint = Color.White)
+          IconBtn("trash", onDelete, size = 20.dp, tint = Color.White, description = "Delete")
         }
       }
-      Original(p, Modifier.weight(1f).fillMaxWidth().navigationBarsPadding().pointerInput(p.optString("id")) {
-        if (isVideo(p)) return@pointerInput
-        var dx = 0f
-        detectHorizontalDragGestures(onDragStart = { dx = 0f }, onDragEnd = { if (dx < -60) step(1) else if (dx > 60) step(-1) }) { _, d -> dx += d }
-      })
+      // A long press: what the bar offers, as a menu by the finger.
+      var menu by remember(p.optString("id")) { mutableStateOf<DpOffset?>(null) }
+      val density = LocalDensity.current
+      Box(Modifier.weight(1f).fillMaxWidth()) {
+        Original(p, Modifier.fillMaxSize().navigationBarsPadding().pointerInput(p.optString("id")) {
+          if (isVideo(p)) return@pointerInput
+          var dx = 0f
+          detectHorizontalDragGestures(onDragStart = { dx = 0f }, onDragEnd = { if (dx < -60) step(1) else if (dx > 60) step(-1) }) { _, d -> dx += d }
+        }.pointerInput(p.optString("id")) {
+          detectTapGestures(onLongPress = { at -> menu = with(density) { DpOffset(at.x.toDp(), at.y.toDp()) } })
+        })
+        Box(Modifier.offset(menu?.x ?: 0.dp, menu?.y ?: 0.dp)) {
+          DropdownMenu(menu != null, { menu = null }, shape = RoundedCornerShape(14.dp), containerColor = Tokens.surface2) {
+            val items = if (p.has("deleted")) listOf("Restore" to onRestore, "Delete forever…" to onDestroy)
+              else listOf("Download" to onDownload, "Share" to onShare, "Info" to onInfo, "Delete" to onDelete)
+            items.forEach { (label, act) -> DropdownMenuItem({ Text(label, fontSize = 15.sp, fontWeight = FontWeight.Medium) }, { menu = null; act() }) }
+          }
+        }
+      }
     }
     // On a phone you swipe; the arrows would cover the photo.
     if (!phone) {
