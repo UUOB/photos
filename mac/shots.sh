@@ -21,18 +21,19 @@ for mode in light dark; do
     # Share hangs under its button.
     click "Share" && { sleep 2; shot share; esc; }
     # Right-click on the photo: the grid's menu.
-    pointer 560 420 right; shot viewer-menu; esc
+    pointer 500 400 right; shot viewer-menu; esc
     cmd i; shot info; esc
     esc
   fi
   hover "Hide sidebar (⌃⌘S)" && shot sidebar-hint
   cmd ","; shot settings
-  se "tell process \"$name\" to click at {1040, 700}"; sleep 1.5; shot outside-click
+  # Beside the sheet, on the window it covers (the screen is 1024 wide).
+  win "click at {70, 640}"; sleep 1.5; shot outside-click
   esc
 done
 
 mode=small
-se "tell process \"$name\" to set size of front window to {520, 620}"; sleep 2
+win "set size of front window to {520, 620}"; sleep 2
 shot grid
 app_down
 uuob_down
