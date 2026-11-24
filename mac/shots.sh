@@ -15,17 +15,21 @@ app_up
 for mode in light dark; do
   [ $mode = dark ] && { se 'tell appearance preferences to set dark mode to true'; sleep 2; }
   shot grid
-  if click "~Photo from"; then
-    sleep 2; shot viewer
-    hover "Info (⌘I)" && shot viewer-hint
+  # The first photo (the grid starts right of the 240-wide sidebar, under the title).
+  pointer 360 250 left; sleep 3
+  if true; then
+    shot viewer
+    # The bar's icons sit at the window's top right: info, share, copy, save, delete.
+    pointer 806 83; sleep 1; shot viewer-hint
     # Share hangs under its button.
-    click "Share" && { sleep 2; shot share; esc; }
+    pointer 850 83 left; sleep 2; shot share; esc
     # Right-click on the photo: the grid's menu.
     pointer 500 400 right; shot viewer-menu; esc
     cmd i; shot info; esc
     esc
   fi
-  hover "Hide sidebar (⌃⌘S)" && shot sidebar-hint
+  # The toggle's hint (an icon has no words to find; the window sits at 12,31, 1000 wide, 680 high).
+  pointer 222 681; sleep 1; shot sidebar-hint
   cmd ","; shot settings
   # Beside the sheet, on the window it covers (the screen is 1024 wide).
   win "click at {70, 640}"; sleep 1.5; shot outside-click
